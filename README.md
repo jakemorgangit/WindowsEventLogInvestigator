@@ -46,8 +46,14 @@ SQL ERRORLOG folder. Started from PowerShell 7, the GUI relaunches itself in 5.1
 # GUI, pre-filled for an incident on two cluster nodes, collecting immediately
 .\WinEventLogInvestigator.ps1 -ComputerName SQLNODE1,SQLNODE2 -StartTime '2026-10-11 22:00' -EndTime '2026-10-12 02:00' -AutoRun
 
-# Headless: CSV + interactive HTML report + collection log
+# Headless: session file + CSV + interactive HTML report + collection log
 .\WinEventLogInvestigator.ps1 -ComputerName SQLNODE1 -Hours 72 -Sources System,SQL,SQLLogs,Cluster -NoGui -OutputPath C:\Temp\RCA
+
+# Review a saved session on another machine (several files are merged)
+.\WinEventLogInvestigator.ps1 -SessionPath .\EventLogSession_SQLNODE1_20261012_093000.json,.\EventLogSession_SQLNODE2_20261012_093000.json
+
+# Turn a session into CSV + HTML without the GUI
+.\WinEventLogInvestigator.ps1 -SessionPath .\EventLogSession_SQLNODE1_20261012_093000.json -NoGui -OutputPath C:\Temp\RCA
 
 # Headless, objects to the pipeline
 .\WinEventLogInvestigator.ps1 -Hours 6 -NoGui | Where-Object LevelNum -le 2
@@ -60,15 +66,41 @@ SQL ERRORLOG folder. Started from PowerShell 7, the GUI relaunches itself in 5.1
 | `-Sources` | System, Application, SQL, SQLLogs, Cluster | Also: HyperV, Security, OpsMgr |
 | `-IncludeInformation` | off | Collect **all** Information events (noisy). Key informational events are always collected |
 | `-MaxEventsPerQuery` | 5000 | Safety cap per log query. The collection log warns when it is hit |
-| `-NoGui` / `-OutputPath` | | Headless mode |
+| `-NoGui` / `-OutputPath` | | Headless mode. Writes a session `.json`, CSV, HTML report and collection log |
+| `-SessionPath` | | Open one or more saved session files instead of collecting |
 | `-AutoRun` | | GUI: start collecting on open |
+
+## Sessions: collect on one machine, review on another
+
+**File > Save session** (Ctrl+S) writes everything you see to a single `.json` file:
+
+* every collected event, with the full message text
+* the collection log
+* the collection settings: computers, time range, sources, the source server's UTC offset, who collected it and when
+* your current view: level toggles, category, computer, lanes, Event ID filter, search, zoom window and the selected tab
+
+**File > Open session** (Ctrl+O), dragging the file onto the window, or `-SessionPath` restores the same screen on any
+machine. Nothing is needed from the original servers. Typical flow: run `-NoGui -OutputPath` on the server, or
+collect in the GUI and save, then copy the `.json` to your desk. **File > Add session** (or Shift + drag) merges more
+files into the current view, for example one exported from each cluster node. Duplicate events are skipped.
+
+Times are kept as the source server's local time. When the reviewer is in a different time zone, the status bar says so.
+
+## GUI
+
+* **Collection bar:** computers, range preset or custom From / To, a **Sources** drop-down (sources, *all Information events*,
+  max events per query) and **Collect** (F5). Every computer is collected in parallel, with progress in the status bar.
+* **Filter bar:** level toggles, category, computer, lane grouping, Event IDs (`1069 1135` to include, `-7036` to exclude),
+  search (Ctrl+F, Esc to clear), Clear (Ctrl+Shift+X), Zoom out (Ctrl+-) and Reset zoom (Ctrl+0).
+* **Timeline**, then the **Events**, **Top issues** and **Collection log** tabs. The status bar shows counts per level for the current view.
+* View menu: hide the collection bar or the details pane to give the timeline and grid more room. Help > How to use (F1).
 
 ### GUI features
 
 * Filters for level, category, computer, Event IDs (`1069, 1135` to include, `-7036` to exclude) and free-text search.
 * **Top issues** tab groups events by provider + ID with count, first / last seen and number of hosts. Double-click a row to show those events.
 * Detail pane with the full message. Right-click a row to filter to or exclude its Event ID, or to zoom the timeline to ±15 minutes around it.
-* **Open in Excel**, **Save CSV** and **HTML report**. The report is a single self-contained file
+* **Save session**, **Open in Excel**, **Save CSV** (Ctrl+E) and **HTML report** (Ctrl+H). The report is a single self-contained file
   with the same interactive timeline, top issues and searchable events table, ready to attach to an incident ticket.
 * The **Collection log** tab shows what was queried on each server, how many events came back, and any problems
   (log not present, access denied, query cap reached).

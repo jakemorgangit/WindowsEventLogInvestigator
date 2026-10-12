@@ -20,6 +20,10 @@
     failovers. Drag on the timeline to zoom, click a bar or dot to drill in, right-click
     to zoom out. Results export to CSV or a self-contained interactive HTML report.
 
+    A collection can be saved as a session file (.json) holding every event, the collection
+    log, the settings and the current filters / zoom. Open it on any machine (File > Open
+    session, drag and drop, or -SessionPath) to review it without access to the servers.
+
     Run without parameters for the GUI, or with -NoGui for headless collection.
 
 .PARAMETER ComputerName
@@ -47,10 +51,14 @@
     Safety cap per individual log query (default 5000).
 
 .PARAMETER NoGui
-    Collect without the GUI. Writes CSV + HTML to -OutputPath, or returns objects.
+    Collect without the GUI. Writes a session file + CSV + HTML to -OutputPath, or returns objects.
 
 .PARAMETER OutputPath
-    Folder for -NoGui output (CSV + HTML report).
+    Folder for -NoGui output (session .json, CSV, HTML report, collection log).
+
+.PARAMETER SessionPath
+    One or more saved session files (.json) to open instead of collecting. Several files are
+    merged (e.g. one per cluster node). With -NoGui they are converted to CSV + HTML.
 
 .PARAMETER AutoRun
     GUI: start collecting as soon as the window opens.
@@ -63,6 +71,9 @@
 
 .EXAMPLE
     .\WinEventLogInvestigator.ps1 -ComputerName SQLNODE1 -Hours 72 -Sources System,SQL,SQLLogs,Cluster -NoGui -OutputPath C:\Temp\RCA
+
+.EXAMPLE
+    .\WinEventLogInvestigator.ps1 -SessionPath .\EventLogSession_SQLNODE1_20261012_093000.json
 #>
 #Requires -Version 5.1
 [CmdletBinding()]
@@ -76,11 +87,13 @@ param(
     [ValidateRange(100, 1000000)][int]$MaxEventsPerQuery = 5000,
     [switch]$NoGui,
     [string]$OutputPath,
+    [string[]]$SessionPath,
     [switch]$AutoRun
 )
 
 # Accept comma separated lists too (powershell.exe -File passes 'a,b' as a single string)
 $ComputerName = @($ComputerName | ForEach-Object { $_ -split '[,;\s]+' } | Where-Object { $_ } | Select-Object -Unique)
+$SessionPath = @($SessionPath | ForEach-Object { $_ -split ',' } | Where-Object { $_ } | ForEach-Object { (Resolve-Path -LiteralPath $_ -ErrorAction Stop).ProviderPath -replace '^\\\\\?\\', '' })
 $validSources = 'System', 'Application', 'SQL', 'SQLLogs', 'Cluster', 'HyperV', 'Security', 'OpsMgr'
 $Sources = @($Sources | ForEach-Object { $_ -split '[,;\s]+' } | Where-Object { $_ } | ForEach-Object {
     $src = $_; $match = $validSources | Where-Object { $_ -eq $src }
@@ -100,6 +113,7 @@ if (-not $NoGui -and $PSVersionTable.PSEdition -eq 'Core') {
         '-MaxEventsPerQuery', $MaxEventsPerQuery, '-Sources', ($Sources -join ','))
     if ($IncludeInformation) { $relaunch += '-IncludeInformation' }
     if ($AutoRun) { $relaunch += '-AutoRun' }
+    if ($SessionPath) { $relaunch += @('-SessionPath', ($SessionPath -join ',')) }
     & $winPs @relaunch
     return
 }
@@ -642,6 +656,91 @@ function Export-EventCsv($Rows, [string]$Path) {
         Export-Csv -Path $Path -NoTypeInformation -UseCulture -Encoding UTF8
 }
 
+#---- Session files: everything needed to review a collection on another machine ----
+$script:SessionFormat = 'WinEventLogInvestigator.Session'
+$script:SessionColumns = 'Time', 'Computer', 'Level', 'LevelNum', 'Category', 'Tag', 'Marker', 'Id', 'Provider', 'LogName', 'Source', 'RecordId', 'Message'
+
+function ConvertTo-JsonText($Value) {
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    if ($null -eq $Value) { return 'null' }
+    if ($Value -is [bool]) { if ($Value) { return 'true' } else { return 'false' } }
+    if ($Value -is [datetime]) { return ConvertTo-JsString $Value.ToString('yyyy-MM-ddTHH:mm:ss.fff', $inv) }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) { return [string]::Format($inv, '{0}', $Value) }
+    if ($Value -is [string]) { return ConvertTo-JsString $Value }
+    if ($Value -is [System.Collections.IDictionary]) {
+        return '{' + (($Value.Keys | ForEach-Object { (ConvertTo-JsString ([string]$_)) + ':' + (ConvertTo-JsonText $Value[$_]) }) -join ',') + '}'
+    }
+    if ($Value -is [System.Collections.IEnumerable]) { return '[' + ((@($Value) | ForEach-Object { ConvertTo-JsonText $_ }) -join ',') + ']' }
+    return ConvertTo-JsString ([string]$Value)
+}
+
+function Export-InvestigationSession {
+    param($Rows, [string]$Path, $Collection, $View, [string[]]$RunLog)
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $header = [ordered]@{
+        format = $script:SessionFormat; version = 1
+        exportedAt = (Get-Date); exportedFrom = $env:COMPUTERNAME; exportedBy = "$env:USERDOMAIN\$env:USERNAME"
+        collection = $Collection; view = $View; runLog = @($RunLog); eventColumns = $script:SessionColumns
+    }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('{')
+    foreach ($k in $header.Keys) { [void]$sb.Append((ConvertTo-JsString $k)).Append(':').Append((ConvertTo-JsonText $header[$k])).Append(",`n") }
+    [void]$sb.Append('"events":[')
+    $first = $true
+    foreach ($r in $Rows) {
+        if (-not $first) { [void]$sb.Append(",`n") }; $first = $false
+        [void]$sb.Append('[').Append((ConvertTo-JsString ([datetime]$r.Time).ToString('yyyy-MM-ddTHH:mm:ss.fff', $inv))).Append(',')
+        [void]$sb.Append((ConvertTo-JsString $r.Computer)).Append(',').Append((ConvertTo-JsString $r.Level)).Append(',').Append([int]$r.LevelNum).Append(',')
+        [void]$sb.Append((ConvertTo-JsString $r.Category)).Append(',').Append((ConvertTo-JsString $r.Tag)).Append(',').Append((ConvertTo-JsString $r.Marker)).Append(',')
+        [void]$sb.Append([int]$r.Id).Append(',').Append((ConvertTo-JsString $r.Provider)).Append(',').Append((ConvertTo-JsString $r.LogName)).Append(',')
+        [void]$sb.Append((ConvertTo-JsString $r.Source)).Append(',').Append([long]$r.RecordId).Append(',').Append((ConvertTo-JsString ([string]$r.Message))).Append(']')
+    }
+    [void]$sb.Append("]}`n")
+    [System.IO.File]::WriteAllText($Path, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Get-JsonValue($Object, [string]$Name, $Default = $null) {
+    # JavaScriptSerializer (Windows PowerShell) returns Dictionary<string,object>, ConvertFrom-Json -AsHashtable (PowerShell 7) a Hashtable
+    if ($Object -is [System.Collections.IDictionary] -and $Object.Keys -contains $Name -and $null -ne $Object[$Name]) { return $Object[$Name] }
+    return $Default
+}
+
+# Session times are stored as the source server's local wall-clock time ('yyyy-MM-ddTHH:mm:ss.fff').
+# PowerShell 7's ConvertFrom-Json already turns them into DateTime values; Windows PowerShell leaves strings.
+function ConvertFrom-SessionDate($Value) {
+    if ($null -eq $Value -or $Value -eq '') { return $null }
+    if ($Value -is [datetime]) { return [datetime]::SpecifyKind($Value, [DateTimeKind]::Unspecified) }
+    return [datetime]::ParseExact([string]$Value, [string[]]@('yyyy-MM-ddTHH:mm:ss.fff', 'yyyy-MM-ddTHH:mm:ss', 'o'), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None)
+}
+
+function Read-InvestigationSession([string]$Path) {
+    $text = [System.IO.File]::ReadAllText($Path)
+    if ($PSVersionTable.PSEdition -eq 'Core') { $doc = ConvertFrom-Json -InputObject $text -AsHashtable -Depth 20 }
+    else {
+        Add-Type -AssemblyName System.Web.Extensions
+        $ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+        $ser.MaxJsonLength = [int]::MaxValue; $ser.RecursionLimit = 100
+        $doc = $ser.DeserializeObject($text)
+    }
+    if ((Get-JsonValue $doc 'format') -ne $script:SessionFormat) { throw "'$Path' is not a $script:SessionFormat file." }
+    $cols = @(Get-JsonValue $doc 'eventColumns' @())
+    $ix = @{}; for ($i = 0; $i -lt $cols.Count; $i++) { $ix[[string]$cols[$i]] = $i }
+    $missing = @($script:SessionColumns | Where-Object { -not $ix.ContainsKey($_) })
+    if ($missing) { throw "'$Path' is missing event columns: $($missing -join ', ')" }
+    $iT = $ix.Time; $iC = $ix.Computer; $iL = $ix.Level; $iN = $ix.LevelNum; $iCat = $ix.Category; $iTag = $ix.Tag; $iMk = $ix.Marker
+    $iId = $ix.Id; $iP = $ix.Provider; $iLog = $ix.LogName; $iSrc = $ix.Source; $iRec = $ix.RecordId; $iMsg = $ix.Message
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $events = New-Object System.Collections.Generic.List[object]
+    foreach ($a in @(Get-JsonValue $doc 'events' @())) {
+        $events.Add([pscustomobject]@{
+            Time = $(if ($a[$iT] -is [string]) { [datetime]::ParseExact($a[$iT], 'yyyy-MM-ddTHH:mm:ss.fff', $inv) } else { ConvertFrom-SessionDate $a[$iT] }); Computer = [string]$a[$iC]; Level = [string]$a[$iL]
+            LevelNum = [int]$a[$iN]; Category = [string]$a[$iCat]; Tag = [string]$a[$iTag]; Marker = [string]$a[$iMk]; Id = [int]$a[$iId]
+            Provider = [string]$a[$iP]; LogName = [string]$a[$iLog]; Source = [string]$a[$iSrc]; RecordId = [long]$a[$iRec]; Message = [string]$a[$iMsg]
+        })
+    }
+    return @{ Path = $Path; Document = $doc; Events = $events }
+}
+
 function ConvertTo-JsString([string]$s) {
     if ($null -eq $s) { return '""' }
     $s = $s.Replace('\', '\\').Replace('"', '\"').Replace("`r", '').Replace("`n", '\n').Replace("`t", '\t').Replace('</', '<\/')
@@ -843,26 +942,56 @@ render();
 #endregion
 
 #region ===================== Headless mode =====================
+function Get-SessionFileName([string[]]$Computers) {
+    $names = ($Computers | Select-Object -First 3) -join '_'
+    if ($Computers.Count -gt 3) { $names += "_and_$($Computers.Count - 3)_more" }
+    return ('EventLogSession_{0}_{1}.json' -f ($names -replace '[^\w\.-]', '_'), (Get-Date -Format 'yyyyMMdd_HHmmss'))
+}
+
 if ($NoGui) {
     $allEvents = New-Object System.Collections.Generic.List[object]
     $allLog = New-Object System.Collections.Generic.List[string]
-    foreach ($c in $ComputerName) {
-        $r = & $Collector $c $StartTime $EndTime $Sources $MaxEventsPerQuery ([bool]$IncludeInformation)
-        if ($r) { $allEvents.AddRange([object[]]$r.Events); $allLog.AddRange([string[]]$r.Log) }
+    if ($SessionPath) {
+        # Convert saved session(s) to CSV / HTML (or objects) without collecting anything
+        $starts = @(); $ends = @(); $comps = @()
+        foreach ($p in $SessionPath) {
+            $sess = Read-InvestigationSession $p
+            $col = Get-JsonValue $sess.Document 'collection'
+            $starts += ConvertFrom-SessionDate (Get-JsonValue $col 'start')
+            $ends += ConvertFrom-SessionDate (Get-JsonValue $col 'end')
+            $comps += @(Get-JsonValue $col 'computers' @())
+            $allEvents.AddRange([object[]]$sess.Events)
+            foreach ($l in @(Get-JsonValue $sess.Document 'runLog' @())) { $allLog.Add([string]$l) }
+        }
+        $StartTime = ($starts | Measure-Object -Minimum).Minimum; $EndTime = ($ends | Measure-Object -Maximum).Maximum
+        $ComputerName = @($comps | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+    } else {
+        foreach ($c in $ComputerName) {
+            $r = & $Collector $c $StartTime $EndTime $Sources $MaxEventsPerQuery ([bool]$IncludeInformation)
+            if ($r) { $allEvents.AddRange([object[]]$r.Events); $allLog.AddRange([string[]]$r.Log) }
+        }
     }
-    $allLog | ForEach-Object { Write-Verbose $_ -Verbose:($VerbosePreference -ne 'SilentlyContinue') }
-    $sorted = $allEvents | Sort-Object Time
+    $sorted = @($allEvents | Sort-Object Time)
     if ($OutputPath) {
         if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
-        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-        $csv = Join-Path $OutputPath "EventLogInvestigation_$stamp.csv"
-        $htmlPath = Join-Path $OutputPath "EventLogInvestigation_$stamp.html"
-        $logPath = Join-Path $OutputPath "EventLogInvestigation_$stamp.log"
-        Export-EventCsv $sorted $csv
-        New-HtmlReport -Rows $sorted -Path $htmlPath -Start $StartTime -End $EndTime -Computers $ComputerName -RunLog $allLog
-        $allLog | Set-Content -Path $logPath -Encoding UTF8
+        $base = Join-Path $OutputPath ([IO.Path]::GetFileNameWithoutExtension((Get-SessionFileName $ComputerName)))
+        $written = @()
+        if (-not $SessionPath) {
+            $collection = [ordered]@{
+                start = $StartTime; end = $EndTime; computers = $ComputerName; sources = $Sources; includeInformation = [bool]$IncludeInformation
+                maxEventsPerQuery = $MaxEventsPerQuery; collectedAt = (Get-Date); collectedOn = $env:COMPUTERNAME
+                utcOffsetMinutes = [int][TimeZoneInfo]::Local.GetUtcOffset($StartTime).TotalMinutes
+            }
+            Export-InvestigationSession -Rows $sorted -Path "$base.json" -Collection $collection -View $null -RunLog $allLog
+            $written += "$base.json"
+        }
+        Export-EventCsv $sorted "$base.csv"
+        New-HtmlReport -Rows $sorted -Path "$base.html" -Start $StartTime -End $EndTime -Computers $ComputerName -RunLog $allLog
+        $allLog | Set-Content -Path "$base.log" -Encoding UTF8
+        $written += "$base.csv", "$base.html", "$base.log"
         $allLog | ForEach-Object { Write-Host $_ }
-        Write-Host "`n$($allEvents.Count) events written to:`n  $csv`n  $htmlPath`n  $logPath"
+        Write-Host "`n$($sorted.Count) events written to:"
+        $written | ForEach-Object { Write-Host "  $_" }
     } else {
         $allLog | ForEach-Object { Write-Host $_ }
         $sorted
@@ -877,23 +1006,98 @@ Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms.DataVisualization
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
+# Dark renderer for menus, toolbars and the status bar
+if (-not ('WELI.DarkRenderer' -as [type])) {
+    Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
+using System.Drawing;
+using System.Windows.Forms;
+namespace WELI {
+    public class DarkColors : ProfessionalColorTable {
+        static readonly Color Bg = Color.FromArgb(45, 45, 48), Bg2 = Color.FromArgb(37, 37, 40), Hover = Color.FromArgb(62, 62, 66);
+        static readonly Color Border = Color.FromArgb(70, 70, 74), Accent = Color.FromArgb(0, 122, 204), Checked = Color.FromArgb(0, 84, 140);
+        public override Color ToolStripGradientBegin { get { return Bg; } }
+        public override Color ToolStripGradientMiddle { get { return Bg; } }
+        public override Color ToolStripGradientEnd { get { return Bg; } }
+        public override Color ToolStripBorder { get { return Bg; } }
+        public override Color ToolStripDropDownBackground { get { return Bg2; } }
+        public override Color ToolStripContentPanelGradientBegin { get { return Bg; } }
+        public override Color ToolStripContentPanelGradientEnd { get { return Bg; } }
+        public override Color MenuStripGradientBegin { get { return Bg; } }
+        public override Color MenuStripGradientEnd { get { return Bg; } }
+        public override Color StatusStripGradientBegin { get { return Bg2; } }
+        public override Color StatusStripGradientEnd { get { return Bg2; } }
+        public override Color ImageMarginGradientBegin { get { return Bg2; } }
+        public override Color ImageMarginGradientMiddle { get { return Bg2; } }
+        public override Color ImageMarginGradientEnd { get { return Bg2; } }
+        public override Color MenuBorder { get { return Border; } }
+        public override Color MenuItemBorder { get { return Border; } }
+        public override Color MenuItemSelected { get { return Hover; } }
+        public override Color MenuItemSelectedGradientBegin { get { return Hover; } }
+        public override Color MenuItemSelectedGradientEnd { get { return Hover; } }
+        public override Color MenuItemPressedGradientBegin { get { return Bg2; } }
+        public override Color MenuItemPressedGradientMiddle { get { return Bg2; } }
+        public override Color MenuItemPressedGradientEnd { get { return Bg2; } }
+        public override Color ButtonSelectedHighlight { get { return Hover; } }
+        public override Color ButtonSelectedGradientBegin { get { return Hover; } }
+        public override Color ButtonSelectedGradientMiddle { get { return Hover; } }
+        public override Color ButtonSelectedGradientEnd { get { return Hover; } }
+        public override Color ButtonSelectedBorder { get { return Border; } }
+        public override Color ButtonPressedGradientBegin { get { return Accent; } }
+        public override Color ButtonPressedGradientMiddle { get { return Accent; } }
+        public override Color ButtonPressedGradientEnd { get { return Accent; } }
+        public override Color ButtonPressedBorder { get { return Accent; } }
+        public override Color ButtonCheckedGradientBegin { get { return Checked; } }
+        public override Color ButtonCheckedGradientMiddle { get { return Checked; } }
+        public override Color ButtonCheckedGradientEnd { get { return Checked; } }
+        public override Color ButtonCheckedHighlight { get { return Checked; } }
+        public override Color ButtonCheckedHighlightBorder { get { return Accent; } }
+        public override Color CheckBackground { get { return Checked; } }
+        public override Color CheckSelectedBackground { get { return Accent; } }
+        public override Color CheckPressedBackground { get { return Accent; } }
+        public override Color SeparatorDark { get { return Border; } }
+        public override Color SeparatorLight { get { return Bg; } }
+        public override Color GripDark { get { return Border; } }
+        public override Color GripLight { get { return Bg; } }
+        public override Color OverflowButtonGradientBegin { get { return Bg; } }
+        public override Color OverflowButtonGradientMiddle { get { return Bg; } }
+        public override Color OverflowButtonGradientEnd { get { return Bg; } }
+    }
+    public class DarkRenderer : ToolStripProfessionalRenderer {
+        public DarkRenderer() : base(new DarkColors()) { RoundedEdges = false; }
+        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e) {
+            e.TextColor = e.Item.Enabled ? e.Item.ForeColor : Color.FromArgb(115, 115, 120);
+            base.OnRenderItemText(e);
+        }
+        protected override void OnRenderArrow(ToolStripArrowRenderEventArgs e) {
+            e.ArrowColor = e.Item == null || e.Item.Enabled ? Color.FromArgb(210, 210, 210) : Color.FromArgb(115, 115, 120);
+            base.OnRenderArrow(e);
+        }
+        protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e) {
+            Rectangle r = new Rectangle(e.ImageRectangle.X - 2, e.ImageRectangle.Y - 2, e.ImageRectangle.Width + 4, e.ImageRectangle.Height + 4);
+            using (SolidBrush b = new SolidBrush(Color.FromArgb(0, 84, 140))) { e.Graphics.FillRectangle(b, r); }
+            using (Pen p = new Pen(Color.White, 2)) {
+                e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                e.Graphics.DrawLines(p, new Point[] { new Point(r.Left + 4, r.Top + r.Height / 2), new Point(r.Left + r.Width / 2 - 1, r.Bottom - 5), new Point(r.Right - 4, r.Top + 4) });
+            }
+        }
+    }
+}
+'@
+}
+
 $theme = @{
     FormBackground          = [System.Drawing.Color]::FromArgb(45, 45, 48)
-    FilterBackground        = [System.Drawing.Color]::FromArgb(37, 37, 40)
+    PanelBackground         = [System.Drawing.Color]::FromArgb(37, 37, 40)
     ControlBackground       = [System.Drawing.Color]::FromArgb(60, 60, 63)
     ControlForeground       = [System.Drawing.Color]::FromArgb(220, 220, 220)
     MutedForeground         = [System.Drawing.Color]::FromArgb(150, 150, 155)
-    ButtonBackground        = [System.Drawing.Color]::FromArgb(80, 80, 85)
-    ButtonForeground        = [System.Drawing.Color]::FromArgb(240, 240, 240)
-    GridBackground          = [System.Drawing.Color]::FromArgb(50, 50, 53)
-    GridForeground          = [System.Drawing.Color]::FromArgb(210, 210, 210)
-    GridLines               = [System.Drawing.Color]::FromArgb(72, 72, 76)
-    GridHeaderBackground    = [System.Drawing.Color]::FromArgb(70, 70, 73)
-    GridHeaderForeground    = [System.Drawing.Color]::White
-    GridCellBackground      = [System.Drawing.Color]::FromArgb(60, 60, 63)
-    GridAltCellBackground   = [System.Drawing.Color]::FromArgb(65, 65, 68)
-    GridSelectionBackground = [System.Drawing.Color]::FromArgb(0, 122, 204)
-    GridSelectionForeground = [System.Drawing.Color]::White
+    GridBackground          = [System.Drawing.Color]::FromArgb(42, 42, 45)
+    GridForeground          = [System.Drawing.Color]::FromArgb(215, 215, 215)
+    GridLines               = [System.Drawing.Color]::FromArgb(58, 58, 62)
+    ChartLines              = [System.Drawing.Color]::FromArgb(72, 72, 76)
+    GridHeaderBackground    = [System.Drawing.Color]::FromArgb(52, 52, 56)
+    GridAltCellBackground   = [System.Drawing.Color]::FromArgb(47, 47, 50)
+    GridSelectionBackground = [System.Drawing.Color]::FromArgb(0, 84, 140)
     AccentColor             = [System.Drawing.Color]::FromArgb(0, 122, 204)
 }
 $levelColors = @{
@@ -916,12 +1120,26 @@ $timeFrames = @(
     [PSCustomObject]@{ Name = 'Last 7 days'; Hours = 168 }, [PSCustomObject]@{ Name = 'Last 14 days'; Hours = 336 },
     [PSCustomObject]@{ Name = 'Last 30 days'; Hours = 720 }, [PSCustomObject]@{ Name = 'Custom range'; Hours = 0 }
 )
+$sourceDefs = @(
+    @{ Key = 'System'; Text = 'System log'; Tip = 'Critical / Error / Warning plus boots, shutdowns, BSODs, patching and SQL / cluster service changes.' },
+    @{ Key = 'Application'; Text = 'Application log'; Tip = 'Critical / Error / Warning plus installs and crash reports.' },
+    @{ Key = 'SQL'; Text = 'SQL Server events'; Tip = 'Every SQL provider in the Application log incl. restarts, AG role changes, login failures, slow I/O, corruption...' },
+    @{ Key = 'SQLLogs'; Text = 'SQL ERRORLOG + Agent log'; Tip = 'Parses ERRORLOG / SQLAGENT.OUT for every instance (remote: Remote Registry + admin shares).' },
+    @{ Key = 'Cluster'; Text = 'Failover Cluster'; Tip = 'FailoverClustering Operational, Manager, CSV and Cluster-Aware Updating logs plus cluster events in the System log.' },
+    @{ Key = 'HyperV'; Text = 'Hyper-V'; Tip = 'Hyper-V VMMS, Worker and High-Availability admin logs.' },
+    @{ Key = 'Security'; Text = 'Security audit'; Tip = 'Failed logons, lockouts, Kerberos failures, audit log cleared.' },
+    @{ Key = 'OpsMgr'; Text = 'Operations Manager (SCOM)'; Tip = 'SCOM agent errors.' }
+)
 $script:BucketSteps = 10, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800
 
 # --- State ---
 $script:Jobs = @()
 $script:RunLog = @()
-$script:CollectStart = $null; $script:CollectEnd = $null
+$script:Computers = $ComputerName
+$script:CollectStart = $null; $script:CollectEnd = $null; $script:CollectedAt = $null; $script:CollectedOn = $null
+$script:CollectSources = $Sources; $script:CollectIncludeInfo = [bool]$IncludeInformation; $script:CollectMax = $MaxEventsPerQuery
+$script:UtcOffsetMinutes = $null
+$script:SessionFiles = @()
 $script:ViewStart = $null; $script:ViewEnd = $null
 $script:ZoomStack = New-Object System.Collections.Stack
 $script:SuspendFilter = $false
@@ -943,136 +1161,198 @@ $script:SummaryView = New-Object System.Data.DataView($script:SummaryTable)
 $script:SummaryView.Sort = 'LevelNum ASC, Count DESC'
 
 # --- Control helpers ---
-function New-Label([string]$Text) {
-    $l = New-Object System.Windows.Forms.Label
-    $l.Text = $Text; $l.AutoSize = $true; $l.ForeColor = $theme.ControlForeground
-    $l.Margin = New-Object System.Windows.Forms.Padding(8, 8, 2, 0)
+$renderer = New-Object WELI.DarkRenderer
+$uiFont = New-Object System.Drawing.Font('Segoe UI', 9)
+$uiFontBold = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+
+function New-ToolStrip {
+    $t = New-Object System.Windows.Forms.ToolStrip
+    $t.Renderer = $renderer; $t.GripStyle = [System.Windows.Forms.ToolStripGripStyle]::Hidden
+    $t.BackColor = $theme.FormBackground; $t.ForeColor = $theme.ControlForeground; $t.Font = $uiFont
+    $t.Padding = New-Object System.Windows.Forms.Padding(6, 4, 6, 4)
+    $t
+}
+function New-TsLabel([string]$Text, [switch]$Muted) {
+    $l = New-Object System.Windows.Forms.ToolStripLabel $Text
+    $l.ForeColor = if ($Muted) { $theme.MutedForeground } else { $theme.ControlForeground }
+    $l.Margin = New-Object System.Windows.Forms.Padding(6, 1, 2, 2)
     $l
 }
-function New-Button([string]$Text, [int]$Width = 90) {
-    $b = New-Object System.Windows.Forms.Button
-    $b.Text = $Text; $b.Size = New-Object System.Drawing.Size($Width, 27)
-    $b.BackColor = $theme.ButtonBackground; $b.ForeColor = $theme.ButtonForeground
-    $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat; $b.FlatAppearance.BorderColor = $theme.AccentColor; $b.FlatAppearance.BorderSize = 1
-    $b.Margin = New-Object System.Windows.Forms.Padding(4, 3, 2, 3)
+function New-TsButton([string]$Text, [string]$Tip = $null) {
+    $b = New-Object System.Windows.Forms.ToolStripButton $Text
+    $b.ForeColor = $theme.ControlForeground; $b.DisplayStyle = [System.Windows.Forms.ToolStripItemDisplayStyle]::Text
+    $b.Padding = New-Object System.Windows.Forms.Padding(6, 2, 6, 2)
+    if ($Tip) { $b.ToolTipText = $Tip }
     $b
 }
-function New-CheckBox([string]$Text, [bool]$Checked, $Color = $null) {
-    $c = New-Object System.Windows.Forms.CheckBox
-    $c.Text = $Text; $c.AutoSize = $true; $c.Checked = $Checked
-    $c.ForeColor = if ($Color) { $Color } else { $theme.ControlForeground }
-    $c.Margin = New-Object System.Windows.Forms.Padding(6, 7, 2, 0)
-    $c
+function New-TsTextBox([int]$Width, [string]$Tip = $null) {
+    $t = New-Object System.Windows.Forms.ToolStripTextBox
+    $t.AutoSize = $false; $t.Width = $Width
+    $t.BackColor = $theme.ControlBackground; $t.ForeColor = $theme.ControlForeground; $t.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    if ($Tip) { $t.ToolTipText = $Tip }
+    $t
 }
-function New-ComboBox([int]$Width, [object[]]$Items) {
+# ToolStripComboBox ignores BackColor, so host a flat ComboBox instead. The ToolStrip host is kept in .Tag.
+function New-TsComboBox([int]$Width, [object[]]$Items, [string]$Tip = $null) {
     $c = New-Object System.Windows.Forms.ComboBox
     $c.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList; $c.Width = $Width
     $c.BackColor = $theme.ControlBackground; $c.ForeColor = $theme.ControlForeground; $c.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $c.Margin = New-Object System.Windows.Forms.Padding(2, 4, 2, 2)
     foreach ($i in $Items) { [void]$c.Items.Add($i) }
+    $h = New-Object System.Windows.Forms.ToolStripControlHost $c
+    $h.Margin = New-Object System.Windows.Forms.Padding(2, 1, 2, 1)
+    if ($Tip) { $h.ToolTipText = $Tip }
+    $c.Tag = $h
     $c
 }
-function New-TextBox([int]$Width, [string]$Text = '') {
-    $t = New-Object System.Windows.Forms.TextBox
-    $t.Width = $Width; $t.Text = $Text
-    $t.BackColor = $theme.ControlBackground; $t.ForeColor = $theme.ControlForeground; $t.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-    $t.Margin = New-Object System.Windows.Forms.Padding(2, 5, 2, 2)
-    $t
-}
-function New-FlowPanel($BackColor) {
-    $p = New-Object System.Windows.Forms.FlowLayoutPanel
-    $p.Dock = [System.Windows.Forms.DockStyle]::Top; $p.AutoSize = $true; $p.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-    $p.WrapContents = $true; $p.BackColor = $BackColor; $p.Padding = New-Object System.Windows.Forms.Padding(4, 4, 4, 4)
-    $p
+function New-MenuItem([string]$Text, $Shortcut = $null, [string]$ShortcutText = $null) {
+    $m = New-Object System.Windows.Forms.ToolStripMenuItem $Text
+    $m.ForeColor = $theme.ControlForeground
+    if ($Shortcut) { $m.ShortcutKeys = $Shortcut }
+    if ($ShortcutText) { $m.ShortcutKeyDisplayString = $ShortcutText }
+    $m
 }
 function Set-DoubleBuffered($Control) {
     $Control.GetType().GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'NonPublic,Instance').SetValue($Control, $true, $null)
+}
+function Set-GridStyle($Grid) {
+    $Grid.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $Grid.ReadOnly = $true; $Grid.AllowUserToAddRows = $false; $Grid.AllowUserToDeleteRows = $false; $Grid.AllowUserToResizeRows = $false
+    $Grid.RowHeadersVisible = $false; $Grid.AutoGenerateColumns = $false
+    $Grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+    $Grid.ClipboardCopyMode = [System.Windows.Forms.DataGridViewClipboardCopyMode]::EnableAlwaysIncludeHeaderText
+    $Grid.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+    $Grid.CellBorderStyle = [System.Windows.Forms.DataGridViewCellBorderStyle]::SingleHorizontal
+    $Grid.ColumnHeadersBorderStyle = [System.Windows.Forms.DataGridViewHeaderBorderStyle]::None
+    $Grid.ColumnHeadersHeightSizeMode = [System.Windows.Forms.DataGridViewColumnHeadersHeightSizeMode]::DisableResizing
+    $Grid.ColumnHeadersHeight = 30; $Grid.RowTemplate.Height = 24
+    $Grid.BackgroundColor = $theme.GridBackground; $Grid.ForeColor = $theme.GridForeground; $Grid.GridColor = $theme.GridLines
+    $Grid.DefaultCellStyle.BackColor = $theme.GridBackground; $Grid.DefaultCellStyle.ForeColor = $theme.GridForeground
+    $Grid.DefaultCellStyle.SelectionBackColor = $theme.GridSelectionBackground; $Grid.DefaultCellStyle.SelectionForeColor = [System.Drawing.Color]::White
+    $Grid.DefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding(4, 0, 4, 0)
+    $Grid.AlternatingRowsDefaultCellStyle.BackColor = $theme.GridAltCellBackground
+    $Grid.ColumnHeadersDefaultCellStyle.BackColor = $theme.GridHeaderBackground; $Grid.ColumnHeadersDefaultCellStyle.ForeColor = $theme.MutedForeground
+    $Grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = $theme.GridHeaderBackground
+    $Grid.ColumnHeadersDefaultCellStyle.Font = $uiFontBold
+    $Grid.ColumnHeadersDefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding(4, 0, 4, 0)
+    $Grid.EnableHeadersVisualStyles = $false
+    Set-DoubleBuffered $Grid
+}
+function Add-GridColumn($Grid, [string]$Prop, [string]$Header, [int]$Width, [string]$Format = $null, [switch]$Fill) {
+    $col = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $col.DataPropertyName = $Prop; $col.Name = $Prop; $col.HeaderText = $Header; $col.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::Automatic
+    if ($Format) { $col.DefaultCellStyle.Format = $Format }
+    if ($Fill) { $col.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::Fill; $col.MinimumWidth = 250 } else { $col.Width = $Width }
+    [void]$Grid.Columns.Add($col)
+}
+function New-LogTextBox {
+    $t = New-Object System.Windows.Forms.TextBox
+    $t.Multiline = $true; $t.ReadOnly = $true; $t.ScrollBars = [System.Windows.Forms.ScrollBars]::Both
+    $t.Dock = [System.Windows.Forms.DockStyle]::Fill; $t.Font = New-Object System.Drawing.Font('Consolas', 9.5)
+    $t.BackColor = $theme.PanelBackground; $t.ForeColor = $theme.ControlForeground; $t.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+    $t
 }
 
 # --- Form ---
 $mainForm = New-Object System.Windows.Forms.Form
 $mainForm.Text = 'Windows Event Log Investigator'
-$mainForm.Size = New-Object System.Drawing.Size(1400, 900)
-$mainForm.MinimumSize = New-Object System.Drawing.Size(900, 600)
+$mainForm.Size = New-Object System.Drawing.Size(1440, 920)
+$mainForm.MinimumSize = New-Object System.Drawing.Size(1000, 640)
 $mainForm.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
 $mainForm.BackColor = $theme.FormBackground
 $mainForm.ForeColor = $theme.ControlForeground
-$mainForm.Font = New-Object System.Drawing.Font('Segoe UI', 9)
-$toolTip = New-Object System.Windows.Forms.ToolTip
+$mainForm.Font = $uiFont
+$mainForm.KeyPreview = $true
+$mainForm.AllowDrop = $true
 
-# Row 1 + 2: what / when / where to collect
-$pnlCollect = New-FlowPanel $theme.FormBackground
-$lblComputers = New-Label 'Computers:'
-$txtComputers = New-TextBox 230 ($ComputerName -join ', ')
-$toolTip.SetToolTip($txtComputers, 'Comma separated list of servers to collect from (e.g. all nodes of a cluster).')
-$btnClusterNodes = New-Button '+ Cluster nodes' 110
-$toolTip.SetToolTip($btnClusterNodes, 'Add every node of the cluster that the first computer belongs to.')
-$lblRange = New-Label 'Range:'
-$cmbRange = New-ComboBox 120 ($timeFrames | ForEach-Object { $_.Name })
-$lblFrom = New-Label 'From:'
+# Menu
+$menu = New-Object System.Windows.Forms.MenuStrip
+$menu.Renderer = $renderer; $menu.BackColor = $theme.FormBackground; $menu.ForeColor = $theme.ControlForeground; $menu.Font = $uiFont
+$mnuFile = New-MenuItem '&File'
+$miOpen = New-MenuItem '&Open session...' ([System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::O)
+$miAdd = New-MenuItem '&Add session (merge)...'
+$miAdd.ToolTipText = 'Add more session files to what is loaded, e.g. one exported from each cluster node.'
+$miSave = New-MenuItem '&Save session...' ([System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::S)
+$miCsv = New-MenuItem 'Export displayed events to &CSV...' ([System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::E)
+$miExcel = New-MenuItem 'Open displayed events in &Excel'
+$miHtml = New-MenuItem 'Save &HTML report...' ([System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::H)
+$miExit = New-MenuItem 'E&xit'
+[void]$mnuFile.DropDownItems.AddRange(@($miOpen, $miAdd, $miSave, (New-Object System.Windows.Forms.ToolStripSeparator), $miCsv, $miExcel, $miHtml,
+        (New-Object System.Windows.Forms.ToolStripSeparator), $miExit))
+$mnuView = New-MenuItem '&View'
+$miCollect = New-MenuItem '&Collect now' ([System.Windows.Forms.Keys]::F5)
+$miFind = New-MenuItem '&Search events' ([System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::F)
+$miZoomOut = New-MenuItem '&Zoom out' ([System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::OemMinus) 'Ctrl+-'
+$miResetZoom = New-MenuItem '&Reset zoom' ([System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::D0) 'Ctrl+0'
+$miClearFilters = New-MenuItem 'C&lear filters' ([System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::Shift -bor [System.Windows.Forms.Keys]::X) 'Ctrl+Shift+X'
+$miShowCollect = New-MenuItem 'Collection &bar'; $miShowCollect.CheckOnClick = $true; $miShowCollect.Checked = $true
+$miShowDetail = New-MenuItem '&Details pane'; $miShowDetail.CheckOnClick = $true; $miShowDetail.Checked = $true
+[void]$mnuView.DropDownItems.AddRange(@($miCollect, $miFind, (New-Object System.Windows.Forms.ToolStripSeparator), $miZoomOut, $miResetZoom, $miClearFilters,
+        (New-Object System.Windows.Forms.ToolStripSeparator), $miShowCollect, $miShowDetail))
+$mnuHelp = New-MenuItem '&Help'
+$miTips = New-MenuItem '&How to use' ([System.Windows.Forms.Keys]::F1)
+[void]$mnuHelp.DropDownItems.Add($miTips)
+[void]$menu.Items.AddRange(@($mnuFile, $mnuView, $mnuHelp))
+
+# Collection bar: where / when / what
+$tsCollect = New-ToolStrip
+$txtComputers = New-TsTextBox 240 'Servers to collect from, comma separated (e.g. every node of a cluster).'
+$txtComputers.Text = $ComputerName -join ', '
+$btnClusterNodes = New-TsButton '+ Cluster nodes' 'Add every node of the cluster that the first computer belongs to.'
+$cmbRange = New-TsComboBox 125 ($timeFrames | ForEach-Object { $_.Name })
 $dtpFrom = New-Object System.Windows.Forms.DateTimePicker
-$lblTo = New-Label 'To:'
 $dtpTo = New-Object System.Windows.Forms.DateTimePicker
 foreach ($d in $dtpFrom, $dtpTo) {
     $d.Format = [System.Windows.Forms.DateTimePickerFormat]::Custom; $d.CustomFormat = 'yyyy-MM-dd HH:mm:ss'; $d.Width = 150
-    $d.Margin = New-Object System.Windows.Forms.Padding(2, 4, 2, 2)
     $d.MinDate = (Get-Date).AddYears(-20); $d.MaxDate = (Get-Date).AddYears(1)
 }
-$btnCollect = New-Button 'Collect' 90
-$btnCollect.BackColor = $theme.AccentColor
-$btnCancel = New-Button 'Cancel' 70
-$btnCancel.Enabled = $false
-$pnlCollect.Controls.AddRange(@($lblComputers, $txtComputers, $btnClusterNodes, $lblRange, $cmbRange, $lblFrom, $dtpFrom, $lblTo, $dtpTo, $btnCollect, $btnCancel))
-$pnlCollect.SetFlowBreak($btnCancel, $true)
+$hostFrom = New-Object System.Windows.Forms.ToolStripControlHost $dtpFrom
+$hostTo = New-Object System.Windows.Forms.ToolStripControlHost $dtpTo
+$ddSources = New-Object System.Windows.Forms.ToolStripDropDownButton 'Sources'
+$ddSources.ForeColor = $theme.ControlForeground
+$ddSources.DropDown.BackColor = $theme.PanelBackground
+$sourceItems = @{}
+foreach ($def in $sourceDefs) {
+    $mi = New-MenuItem $def.Text
+    $mi.CheckOnClick = $true; $mi.Checked = ($def.Key -in $Sources); $mi.ToolTipText = $def.Tip; $mi.Tag = $def.Key
+    $sourceItems[$def.Key] = $mi
+    [void]$ddSources.DropDownItems.Add($mi)
+}
+$miIncludeInfo = New-MenuItem 'Also collect ALL Information events (noisy)'
+$miIncludeInfo.CheckOnClick = $true; $miIncludeInfo.Checked = [bool]$IncludeInformation
+$miIncludeInfo.ToolTipText = 'Key informational events (reboots, failovers, SQL restarts, patching) are always collected.'
+$lblMax = New-TsLabel 'Max events per log query:' -Muted
+$cmbMax = New-Object System.Windows.Forms.ToolStripComboBox
+$cmbMax.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown; $cmbMax.BackColor = $theme.ControlBackground; $cmbMax.ForeColor = $theme.ControlForeground
+foreach ($v in 1000, 5000, 20000, 100000) { [void]$cmbMax.Items.Add([string]$v) }
+$cmbMax.Text = [string]$MaxEventsPerQuery
+[void]$ddSources.DropDownItems.AddRange(@((New-Object System.Windows.Forms.ToolStripSeparator), $miIncludeInfo, (New-Object System.Windows.Forms.ToolStripSeparator), $lblMax, $cmbMax))
+$ddSources.DropDown.Add_Closing({ param($s, $e) if ($e.CloseReason -eq [System.Windows.Forms.ToolStripDropDownCloseReason]::ItemClicked) { $e.Cancel = $true } })
+$btnCollect = New-TsButton ("$([char]0x25B6)  Collect") 'Collect events from the computers above (F5).'
+$btnCollect.BackColor = $theme.AccentColor; $btnCollect.ForeColor = [System.Drawing.Color]::White; $btnCollect.Font = $uiFontBold
+$btnCancel = New-TsButton 'Cancel'; $btnCancel.Enabled = $false
+[void]$tsCollect.Items.AddRange(@((New-TsLabel 'Computers'), $txtComputers, $btnClusterNodes, (New-Object System.Windows.Forms.ToolStripSeparator),
+        (New-TsLabel 'Range'), $cmbRange.Tag, (New-TsLabel 'From' -Muted), $hostFrom, (New-TsLabel 'To' -Muted), $hostTo,
+        (New-Object System.Windows.Forms.ToolStripSeparator), $ddSources, (New-Object System.Windows.Forms.ToolStripSeparator), $btnCollect, $btnCancel))
 
-$lblSources = New-Label 'Sources:'
-$chkSrcSystem = New-CheckBox 'System' ('System' -in $Sources)
-$chkSrcApp = New-CheckBox 'Application' ('Application' -in $Sources)
-$chkSrcSql = New-CheckBox 'SQL Server events' ('SQL' -in $Sources)
-$chkSrcSqlLogs = New-CheckBox 'SQL ERRORLOG + Agent log' ('SQLLogs' -in $Sources)
-$chkSrcCluster = New-CheckBox 'Failover Cluster' ('Cluster' -in $Sources)
-$chkSrcHyperV = New-CheckBox 'Hyper-V' ('HyperV' -in $Sources)
-$chkSrcSecurity = New-CheckBox 'Security audit' ('Security' -in $Sources)
-$chkSrcOpsMgr = New-CheckBox 'OpsMgr' ('OpsMgr' -in $Sources)
-$chkIncludeInfo = New-CheckBox 'All Information events (noisy)' ([bool]$IncludeInformation) $theme.MutedForeground
-$lblMax = New-Label 'Max/query:'
-$nudMax = New-Object System.Windows.Forms.NumericUpDown
-$nudMax.Minimum = 100; $nudMax.Maximum = 1000000; $nudMax.Increment = 1000; $nudMax.Value = $MaxEventsPerQuery; $nudMax.Width = 80
-$nudMax.BackColor = $theme.ControlBackground; $nudMax.ForeColor = $theme.ControlForeground; $nudMax.Margin = New-Object System.Windows.Forms.Padding(2, 5, 2, 2)
-$toolTip.SetToolTip($chkSrcSql, 'All SQL Server providers in the Application log (every instance, Agent, SSIS, SSRS, VSS writer...) incl. key informational events: restarts, AG role changes, login failures, slow I/O...')
-$toolTip.SetToolTip($chkSrcSqlLogs, 'Parses ERRORLOG / SQLAGENT.OUT files for every instance found in the registry (remote: Remote Registry + admin shares).')
-$toolTip.SetToolTip($chkSrcCluster, 'FailoverClustering Operational, Manager, CSV and Cluster-Aware Updating logs plus cluster events in the System log.')
-$toolTip.SetToolTip($chkIncludeInfo, 'Key informational events (reboots, failovers, SQL restarts, patching) are always collected. Tick this to collect every Information event as well.')
-$pnlCollect.Controls.AddRange(@($lblSources, $chkSrcSystem, $chkSrcApp, $chkSrcSql, $chkSrcSqlLogs, $chkSrcCluster, $chkSrcHyperV, $chkSrcSecurity, $chkSrcOpsMgr, $chkIncludeInfo, $lblMax, $nudMax))
-
-# Row 3: filters for what is displayed
-$pnlFilter = New-FlowPanel $theme.FilterBackground
-$lblShow = New-Label 'Show:'
-$chkCrit = New-CheckBox 'Critical' $true $levelColors[1]
-$chkErr = New-CheckBox 'Error' $true $levelColors[2]
-$chkWarn = New-CheckBox 'Warning' $true $levelColors[3]
-$chkInfo = New-CheckBox 'Info' $true $levelColors[4]
-$lblCategory = New-Label 'Category:'
-$cmbCategory = New-ComboBox 150 @('(All)')
-$lblComputer = New-Label 'Computer:'
-$cmbComputer = New-ComboBox 120 @('(All)')
-$lblLanes = New-Label 'Lanes:'
-$cmbLanes = New-ComboBox 130 @('Category', 'Computer', 'Computer + Category', 'Provider')
-$lblIds = New-Label 'Event IDs:'
-$txtIds = New-TextBox 110
-$toolTip.SetToolTip($txtIds, "Comma/space separated. E.g. '1069, 1135' or '-7036' to exclude.")
-$lblSearch = New-Label 'Search:'
-$txtSearch = New-TextBox 170
-$toolTip.SetToolTip($txtSearch, 'Searches message, provider, description and computer.')
-$btnClearFilter = New-Button 'Clear' 55
-$btnZoomOut = New-Button 'Zoom out' 75
-$btnResetZoom = New-Button 'Reset zoom' 85
-$btnOpenCsv = New-Button 'Open in Excel' 100
-$btnExportCsv = New-Button 'Save CSV...' 85
-$btnHtml = New-Button 'HTML report...' 105
-$toolTip.SetToolTip($btnHtml, 'Save a self-contained interactive HTML report (timeline, top issues, events) to share.')
-$pnlFilter.Controls.AddRange(@($lblShow, $chkCrit, $chkErr, $chkWarn, $chkInfo, $lblCategory, $cmbCategory, $lblComputer, $cmbComputer, $lblLanes, $cmbLanes,
-        $lblIds, $txtIds, $lblSearch, $txtSearch, $btnClearFilter, $btnZoomOut, $btnResetZoom, $btnOpenCsv, $btnExportCsv, $btnHtml))
+# Filter bar: what is displayed
+$tsFilter = New-ToolStrip
+$tsFilter.BackColor = $theme.PanelBackground
+$bullet = [char]0x25CF
+$chkCrit = New-TsButton "$bullet Critical"; $chkErr = New-TsButton "$bullet Error"; $chkWarn = New-TsButton "$bullet Warning"; $chkInfo = New-TsButton "$bullet Info"
+$i = 1
+foreach ($b in $chkCrit, $chkErr, $chkWarn, $chkInfo) { $b.CheckOnClick = $true; $b.Checked = $true; $b.ForeColor = $levelColors[$i]; $b.ToolTipText = "Show / hide $($levelNames[$i]) events"; $i++ }
+$cmbCategory = New-TsComboBox 165 @('All categories')
+$cmbComputer = New-TsComboBox 140 @('All computers')
+$cmbLanes = New-TsComboBox 165 @('Lanes: Category', 'Lanes: Computer', 'Lanes: Computer + Category', 'Lanes: Provider') 'What the swim lanes under the timeline are grouped by.'
+$txtIds = New-TsTextBox 110 "Event IDs, comma/space separated. E.g. '1069 1135' or '-7036' to exclude."
+$txtSearch = New-TsTextBox 210 'Search message, provider, description, computer and category (Ctrl+F).'
+$btnClearFilter = New-TsButton 'Clear' 'Clear all filters (Ctrl+Shift+X)'
+$btnResetZoom = New-TsButton 'Reset zoom' 'Show the whole collected range (Ctrl+0)'
+$btnZoomOut = New-TsButton 'Zoom out' 'Back to the previous zoom level (Ctrl+- or right-click the chart)'
+foreach ($b in $btnResetZoom, $btnZoomOut) { $b.Alignment = [System.Windows.Forms.ToolStripItemAlignment]::Right }
+[void]$tsFilter.Items.AddRange(@($chkCrit, $chkErr, $chkWarn, $chkInfo, (New-Object System.Windows.Forms.ToolStripSeparator),
+        $cmbCategory.Tag, $cmbComputer.Tag, $cmbLanes.Tag, (New-Object System.Windows.Forms.ToolStripSeparator),
+        (New-TsLabel 'IDs' -Muted), $txtIds, (New-TsLabel 'Search' -Muted), $txtSearch, $btnClearFilter, $btnResetZoom, $btnZoomOut))
 $cmbCategory.SelectedIndex = 0; $cmbComputer.SelectedIndex = 0; $cmbLanes.SelectedIndex = 0
 
 # --- Timeline chart ---
@@ -1085,8 +1365,8 @@ $caLanes = New-Object System.Windows.Forms.DataVisualization.Charting.ChartArea 
 foreach ($ca in $caCounts, $caLanes) {
     $ca.BackColor = $theme.GridBackground
     foreach ($ax in $ca.AxisX, $ca.AxisY) {
-        $ax.LineColor = $theme.GridLines; $ax.MajorGrid.LineColor = $theme.GridLines; $ax.MajorTickMark.LineColor = $theme.GridLines
-        $ax.LabelStyle.ForeColor = $theme.ControlForeground; $ax.LabelStyle.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+        $ax.LineColor = $theme.ChartLines; $ax.MajorGrid.LineColor = $theme.ChartLines; $ax.MajorTickMark.LineColor = $theme.ChartLines
+        $ax.LabelStyle.ForeColor = $theme.ControlForeground; $ax.LabelStyle.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
     }
     $ca.AxisX.IntervalAutoMode = [System.Windows.Forms.DataVisualization.Charting.IntervalAutoMode]::VariableCount
     $ca.AxisX.MajorGrid.LineDashStyle = [System.Windows.Forms.DataVisualization.Charting.ChartDashStyle]::Dot
@@ -1097,7 +1377,6 @@ $caLanes.Position.Y = 57; $caLanes.Position.Height = 43
 $caCounts.AxisX.LabelStyle.Enabled = $false
 $caCounts.AxisY.Minimum = 0
 $caCounts.AxisY.LabelStyle.Format = 'N0'
-$caCounts.AxisY.Title = 'Events'; $caCounts.AxisY.TitleForeColor = $theme.MutedForeground
 $caCounts.CursorX.IsUserSelectionEnabled = $true
 $caCounts.CursorX.IntervalType = [System.Windows.Forms.DataVisualization.Charting.DateTimeIntervalType]::Seconds
 $caCounts.CursorX.Interval = 1
@@ -1115,14 +1394,15 @@ $legend = New-Object System.Windows.Forms.DataVisualization.Charting.Legend 'Leg
 $legend.Docking = [System.Windows.Forms.DataVisualization.Charting.Docking]::Top
 $legend.Alignment = [System.Drawing.StringAlignment]::Far
 $legend.BackColor = [System.Drawing.Color]::Transparent; $legend.ForeColor = $theme.ControlForeground
-$legend.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+$legend.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
 $legend.IsDockedInsideChartArea = $false
 $chart.Legends.Add($legend)
 $chartTitle = New-Object System.Windows.Forms.DataVisualization.Charting.Title
-$chartTitle.ForeColor = $theme.ControlForeground; $chartTitle.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$chartTitle.ForeColor = $theme.ControlForeground; $chartTitle.Font = New-Object System.Drawing.Font('Segoe UI', 10)
 $chartTitle.Alignment = [System.Drawing.ContentAlignment]::TopLeft; $chartTitle.Docking = [System.Windows.Forms.DataVisualization.Charting.Docking]::Top
-$chartTitle.Text = 'Choose a time range and sources, then click Collect. Drag on the chart to zoom, click a bar or dot to drill in, right-click to zoom out.'
 $chart.Titles.Add($chartTitle)
+$emptyTitle = 'No events loaded.  Pick computers, a range and sources above and click Collect (F5) - or File > Open session to review an exported collection (you can also drag a .json file here).'
+$chartTitle.Text = $emptyTitle
 
 foreach ($lv in 1, 2, 3, 4) {
     $s = New-Object System.Windows.Forms.DataVisualization.Charting.Series "L$lv"
@@ -1138,112 +1418,110 @@ foreach ($lv in 4, 3, 2, 1) {
     $s.XValueType = [System.Windows.Forms.DataVisualization.Charting.ChartValueType]::DateTime; $s.IsVisibleInLegend = $false
     $chart.Series.Add($s)
 }
+$chartTips = New-Object System.Windows.Forms.ToolTip
+$chartTips.SetToolTip($chart, 'Drag to zoom  |  click a bar to drill into it  |  click a dot to drill in and filter to that lane  |  right-click to zoom out')
 
-# --- Grid + details ---
+# --- Grids, details and log ---
 $dgvEvents = New-Object System.Windows.Forms.DataGridView
-$dgvEvents.Dock = [System.Windows.Forms.DockStyle]::Fill
-$dgvEvents.ReadOnly = $true; $dgvEvents.MultiSelect = $true; $dgvEvents.AllowUserToAddRows = $false; $dgvEvents.AllowUserToDeleteRows = $false
-$dgvEvents.AllowUserToResizeRows = $false; $dgvEvents.RowHeadersVisible = $false; $dgvEvents.AutoGenerateColumns = $false
-$dgvEvents.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
-$dgvEvents.ClipboardCopyMode = [System.Windows.Forms.DataGridViewClipboardCopyMode]::EnableAlwaysIncludeHeaderText
-$dgvEvents.BorderStyle = [System.Windows.Forms.BorderStyle]::None
-$dgvEvents.RowTemplate.Height = 22
-foreach ($g in @($dgvEvents)) {
-    $g.BackgroundColor = $theme.GridBackground; $g.ForeColor = $theme.GridForeground; $g.GridColor = $theme.GridLines
-    $g.DefaultCellStyle.BackColor = $theme.GridCellBackground; $g.DefaultCellStyle.ForeColor = $theme.GridForeground
-    $g.DefaultCellStyle.SelectionBackColor = $theme.GridSelectionBackground; $g.DefaultCellStyle.SelectionForeColor = $theme.GridSelectionForeground
-    $g.AlternatingRowsDefaultCellStyle.BackColor = $theme.GridAltCellBackground
-    $g.ColumnHeadersDefaultCellStyle.BackColor = $theme.GridHeaderBackground; $g.ColumnHeadersDefaultCellStyle.ForeColor = $theme.GridHeaderForeground
-    $g.EnableHeadersVisualStyles = $false
-}
-$dgvSummary = New-Object System.Windows.Forms.DataGridView
-foreach ($p in 'Dock', 'ReadOnly', 'AllowUserToAddRows', 'AllowUserToDeleteRows', 'AllowUserToResizeRows', 'RowHeadersVisible', 'AutoGenerateColumns', 'SelectionMode', 'BorderStyle',
-    'BackgroundColor', 'ForeColor', 'GridColor', 'DefaultCellStyle', 'AlternatingRowsDefaultCellStyle', 'ColumnHeadersDefaultCellStyle', 'EnableHeadersVisualStyles', 'ClipboardCopyMode') {
-    $dgvSummary.$p = $dgvEvents.$p
-}
-$dgvSummary.MultiSelect = $false
-Set-DoubleBuffered $dgvEvents; Set-DoubleBuffered $dgvSummary
-
-function Add-GridColumn($Grid, [string]$Prop, [string]$Header, [int]$Width, [string]$Format = $null, [switch]$Fill) {
-    $col = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $col.DataPropertyName = $Prop; $col.Name = $Prop; $col.HeaderText = $Header; $col.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::Automatic
-    if ($Format) { $col.DefaultCellStyle.Format = $Format }
-    if ($Fill) { $col.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::Fill; $col.MinimumWidth = 250 } else { $col.Width = $Width }
-    [void]$Grid.Columns.Add($col)
-}
-Add-GridColumn $dgvEvents 'Time' 'Time' 150 'yyyy-MM-dd HH:mm:ss.fff'
-Add-GridColumn $dgvEvents 'Computer' 'Computer' 100
-Add-GridColumn $dgvEvents 'Level' 'Level' 75
-Add-GridColumn $dgvEvents 'Category' 'Category' 120
-Add-GridColumn $dgvEvents 'Tag' 'Description' 190
-Add-GridColumn $dgvEvents 'Id' 'Event ID' 60
-Add-GridColumn $dgvEvents 'Provider' 'Provider' 170
+Set-GridStyle $dgvEvents
+$dgvEvents.MultiSelect = $true
+Add-GridColumn $dgvEvents 'Time' 'Time' 160 'yyyy-MM-dd HH:mm:ss.fff'
+Add-GridColumn $dgvEvents 'Computer' 'Computer' 110
+Add-GridColumn $dgvEvents 'Level' 'Level' 80
+Add-GridColumn $dgvEvents 'Category' 'Category' 130
+Add-GridColumn $dgvEvents 'Tag' 'Description' 210
+Add-GridColumn $dgvEvents 'Id' 'Event ID' 70
+Add-GridColumn $dgvEvents 'Provider' 'Provider' 180
 Add-GridColumn $dgvEvents 'Summary' 'Message' 400 -Fill
 $dgvEvents.DataSource = $script:View
 
-Add-GridColumn $dgvSummary 'Count' 'Count' 60
-Add-GridColumn $dgvSummary 'Level' 'Worst level' 80
-Add-GridColumn $dgvSummary 'Category' 'Category' 120
-Add-GridColumn $dgvSummary 'Provider' 'Provider' 170
-Add-GridColumn $dgvSummary 'Id' 'Event ID' 60
-Add-GridColumn $dgvSummary 'Tag' 'Description' 200
-Add-GridColumn $dgvSummary 'First' 'First seen' 130 'yyyy-MM-dd HH:mm:ss'
-Add-GridColumn $dgvSummary 'Last' 'Last seen' 130 'yyyy-MM-dd HH:mm:ss'
-Add-GridColumn $dgvSummary 'Computers' 'Hosts' 50
+$dgvSummary = New-Object System.Windows.Forms.DataGridView
+Set-GridStyle $dgvSummary
+$dgvSummary.MultiSelect = $false
+Add-GridColumn $dgvSummary 'Count' 'Count' 65
+Add-GridColumn $dgvSummary 'Level' 'Worst level' 90
+Add-GridColumn $dgvSummary 'Category' 'Category' 130
+Add-GridColumn $dgvSummary 'Provider' 'Provider' 180
+Add-GridColumn $dgvSummary 'Id' 'Event ID' 70
+Add-GridColumn $dgvSummary 'Tag' 'Description' 210
+Add-GridColumn $dgvSummary 'First' 'First seen' 140 'yyyy-MM-dd HH:mm:ss'
+Add-GridColumn $dgvSummary 'Last' 'Last seen' 140 'yyyy-MM-dd HH:mm:ss'
+Add-GridColumn $dgvSummary 'Computers' 'Hosts' 55
 Add-GridColumn $dgvSummary 'Sample' 'Sample message' 400 -Fill
 $dgvSummary.DataSource = $script:SummaryView
 
-$txtDetail = New-Object System.Windows.Forms.TextBox
-$txtDetail.Multiline = $true; $txtDetail.ReadOnly = $true; $txtDetail.ScrollBars = [System.Windows.Forms.ScrollBars]::Both; $txtDetail.WordWrap = $true
-$txtDetail.Dock = [System.Windows.Forms.DockStyle]::Fill; $txtDetail.Font = New-Object System.Drawing.Font('Consolas', 9)
-$txtDetail.BackColor = $theme.FilterBackground; $txtDetail.ForeColor = $theme.ControlForeground; $txtDetail.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+$txtDetail = New-LogTextBox
+$txtDetail.WordWrap = $true; $txtDetail.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
 $txtDetail.Text = 'Select an event to see its full details.'
-
-$txtRunLog = New-Object System.Windows.Forms.TextBox
-$txtRunLog.Multiline = $true; $txtRunLog.ReadOnly = $true; $txtRunLog.ScrollBars = [System.Windows.Forms.ScrollBars]::Both; $txtRunLog.WordWrap = $false
-$txtRunLog.Dock = [System.Windows.Forms.DockStyle]::Fill; $txtRunLog.Font = New-Object System.Drawing.Font('Consolas', 9)
-$txtRunLog.BackColor = $theme.FilterBackground; $txtRunLog.ForeColor = $theme.ControlForeground; $txtRunLog.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+$txtRunLog = New-LogTextBox
+$txtRunLog.WordWrap = $false
 
 $splitEvents = New-Object System.Windows.Forms.SplitContainer
 $splitEvents.Dock = [System.Windows.Forms.DockStyle]::Fill; $splitEvents.Orientation = [System.Windows.Forms.Orientation]::Horizontal
-$splitEvents.BackColor = $theme.FormBackground
-$splitEvents.Panel1.Controls.Add($dgvEvents); $splitEvents.Panel2.Controls.Add($txtDetail)
+$splitEvents.BackColor = $theme.FormBackground; $splitEvents.SplitterWidth = 5
+$splitEvents.Panel1.Controls.Add($dgvEvents)
+$pnlDetail = New-Object System.Windows.Forms.Panel
+$pnlDetail.Dock = [System.Windows.Forms.DockStyle]::Fill; $pnlDetail.Padding = New-Object System.Windows.Forms.Padding(10, 8, 6, 4); $pnlDetail.BackColor = $theme.PanelBackground
+$pnlDetail.Controls.Add($txtDetail)
+$splitEvents.Panel2.Controls.Add($pnlDetail)
 
-$tabs = New-Object System.Windows.Forms.TabControl
-$tabs.Dock = [System.Windows.Forms.DockStyle]::Fill
-$tabEvents = New-Object System.Windows.Forms.TabPage 'Events'
-$tabSummary = New-Object System.Windows.Forms.TabPage 'Top issues'
-$tabLog = New-Object System.Windows.Forms.TabPage 'Collection log'
-foreach ($t in $tabEvents, $tabSummary, $tabLog) { $t.BackColor = $theme.FormBackground; [void]$tabs.TabPages.Add($t) }
-$tabEvents.Controls.Add($splitEvents); $tabSummary.Controls.Add($dgvSummary); $tabLog.Controls.Add($txtRunLog)
+# Dark "tabs": a toolbar of toggle buttons over a content panel
+$tsTabs = New-ToolStrip
+$tsTabs.Padding = New-Object System.Windows.Forms.Padding(4, 2, 6, 0)
+$tabEvents = New-TsButton 'Events'
+$tabSummary = New-TsButton 'Top issues'
+$tabLog = New-TsButton 'Collection log'
+$lblSession = New-TsLabel '' -Muted
+$lblSession.Alignment = [System.Windows.Forms.ToolStripItemAlignment]::Right
+[void]$tsTabs.Items.AddRange(@($tabEvents, $tabSummary, $tabLog, $lblSession))
+$pnlContent = New-Object System.Windows.Forms.Panel
+$pnlContent.Dock = [System.Windows.Forms.DockStyle]::Fill; $pnlContent.BackColor = $theme.GridBackground
+$pnlLog = New-Object System.Windows.Forms.Panel
+$pnlLog.Dock = [System.Windows.Forms.DockStyle]::Fill; $pnlLog.Padding = New-Object System.Windows.Forms.Padding(10, 8, 6, 4); $pnlLog.BackColor = $theme.PanelBackground
+$pnlLog.Controls.Add($txtRunLog)
+$pnlContent.Controls.AddRange(@($splitEvents, $dgvSummary, $pnlLog))
+$tabPages = @{ Events = @($tabEvents, $splitEvents); Summary = @($tabSummary, $dgvSummary); Log = @($tabLog, $pnlLog) }
 
 $splitMain = New-Object System.Windows.Forms.SplitContainer
 $splitMain.Dock = [System.Windows.Forms.DockStyle]::Fill; $splitMain.Orientation = [System.Windows.Forms.Orientation]::Horizontal
-$splitMain.BackColor = $theme.FormBackground
-$splitMain.Panel1.Controls.Add($chart); $splitMain.Panel2.Controls.Add($tabs)
+$splitMain.BackColor = $theme.FormBackground; $splitMain.SplitterWidth = 6
+$splitMain.Panel1.Controls.Add($chart)
+$splitMain.Panel2.Controls.Add($pnlContent)
+$splitMain.Panel2.Controls.Add($tsTabs)
 
 $ctxMenu = New-Object System.Windows.Forms.ContextMenuStrip
-$miCopy = New-Object System.Windows.Forms.ToolStripMenuItem 'Copy selected rows'
-$miCopy.ShortcutKeys = [System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::C
-$miSelectAll = New-Object System.Windows.Forms.ToolStripMenuItem 'Select all'
-$miOnlyId = New-Object System.Windows.Forms.ToolStripMenuItem 'Show only this Event ID'
-$miExcludeId = New-Object System.Windows.Forms.ToolStripMenuItem 'Exclude this Event ID'
-$miAround = New-Object System.Windows.Forms.ToolStripMenuItem 'Zoom timeline to +/- 15 minutes around this event'
-$miExport = New-Object System.Windows.Forms.ToolStripMenuItem 'Export displayed events to CSV...'
+$ctxMenu.Renderer = $renderer
+$miCopy = New-MenuItem 'Copy selected rows' ([System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::C)
+$miSelectAll = New-MenuItem 'Select all'
+$miOnlyId = New-MenuItem 'Show only this Event ID'
+$miExcludeId = New-MenuItem 'Exclude this Event ID'
+$miAround = New-MenuItem 'Zoom timeline to +/- 15 minutes around this event'
+$miExport = New-MenuItem 'Export displayed events to CSV...'
 $ctxMenu.Items.AddRange(@($miCopy, $miSelectAll, (New-Object System.Windows.Forms.ToolStripSeparator), $miOnlyId, $miExcludeId, $miAround, (New-Object System.Windows.Forms.ToolStripSeparator), $miExport))
 $dgvEvents.ContextMenuStrip = $ctxMenu
 
+# Status bar: message | level counts | progress
 $statusBar = New-Object System.Windows.Forms.StatusStrip
-$statusBar.BackColor = $theme.FormBackground
+$statusBar.Renderer = $renderer; $statusBar.SizingGrip = $false; $statusBar.Font = $uiFont
 $statusLabel = New-Object System.Windows.Forms.ToolStripStatusLabel 'Ready.'
-$statusLabel.ForeColor = $theme.ControlForeground
-[void]$statusBar.Items.Add($statusLabel)
+$statusLabel.ForeColor = $theme.ControlForeground; $statusLabel.Spring = $true; $statusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+$countLabels = @{}
+foreach ($lv in 1..4) {
+    $l = New-Object System.Windows.Forms.ToolStripStatusLabel ''
+    $l.ForeColor = $levelColors[$lv]; $l.Margin = New-Object System.Windows.Forms.Padding(10, 3, 0, 2)
+    $countLabels[$lv] = $l
+}
+$progress = New-Object System.Windows.Forms.ToolStripProgressBar
+$progress.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee; $progress.Visible = $false; $progress.Width = 140
+[void]$statusBar.Items.AddRange(@($statusLabel, $countLabels[1], $countLabels[2], $countLabels[3], $countLabels[4], $progress))
 
-# Fill control first, then top panels (last added docks first = top-most)
+# Fill control first, then top bars (last added docks first = top-most)
 $mainForm.Controls.Add($splitMain)
-$mainForm.Controls.Add($pnlFilter)
-$mainForm.Controls.Add($pnlCollect)
+$mainForm.Controls.Add($tsFilter)
+$mainForm.Controls.Add($tsCollect)
+$mainForm.Controls.Add($menu)
 $mainForm.Controls.Add($statusBar)
+$mainForm.MainMenuStrip = $menu
 
 $pollTimer = New-Object System.Windows.Forms.Timer; $pollTimer.Interval = 500
 $filterTimer = New-Object System.Windows.Forms.Timer; $filterTimer.Interval = 350
@@ -1255,12 +1533,36 @@ function Update-StatusBar([string]$Text, [switch]$ErrorState) {
     $statusBar.Refresh()
 }
 
+function Show-Tab([string]$Name) {
+    foreach ($k in $tabPages.Keys) {
+        $on = ($k -eq $Name)
+        $tabPages[$k][0].Checked = $on
+        $tabPages[$k][0].Font = if ($on) { $uiFontBold } else { $uiFont }
+        $tabPages[$k][1].Visible = $on
+    }
+    $script:CurrentTab = $Name
+}
+
+function Get-SelectedSources { @($sourceDefs | Where-Object { $sourceItems[$_.Key].Checked } | ForEach-Object { $_.Key }) }
+function Update-SourcesButton {
+    $n = @(Get-SelectedSources).Count
+    $ddSources.Text = "Sources ($n of $($sourceDefs.Count))" + $(if ($miIncludeInfo.Checked) { ' + all info' } else { '' })
+}
+
 function Set-RangeFromPreset {
     $tf = $timeFrames[$cmbRange.SelectedIndex]
     if ($tf.Hours -le 0) { return }
     $script:SettingRange = $true
     $now = Get-Date
     $dtpTo.Value = $now; $dtpFrom.Value = $now.AddHours(-$tf.Hours)
+    $script:SettingRange = $false
+}
+function Set-CustomRange([datetime]$From, [datetime]$To) {
+    $script:SettingRange = $true
+    $cmbRange.SelectedIndex = $timeFrames.Count - 1
+    if ($From -lt $dtpFrom.MinDate) { $From = $dtpFrom.MinDate }
+    if ($To -gt $dtpTo.MaxDate) { $dtpTo.MaxDate = $To.AddYears(1); $dtpFrom.MaxDate = $dtpTo.MaxDate }
+    $dtpFrom.Value = $From; $dtpTo.Value = $To
     $script:SettingRange = $false
 }
 
@@ -1310,7 +1612,8 @@ function Update-Visuals {
     foreach ($s in $chart.Series) { $s.Points.Clear() }
     $caCounts.AxisX.StripLines.Clear(); $caLanes.AxisX.StripLines.Clear(); $caLanes.AxisY.CustomLabels.Clear(); $legend.CustomItems.Clear()
     $script:SummaryTable.Rows.Clear()
-    if (-not $script:ViewStart) { return }
+    foreach ($lv in 1..4) { $countLabels[$lv].Text = '' }
+    if (-not $script:ViewStart) { $chartTitle.Text = $emptyTitle; return }
 
     $bucketSec = $script:BucketSteps | Where-Object { ($script:ViewEnd - $script:ViewStart).TotalSeconds / $_ -le 120 } | Select-Object -First 1
     if (-not $bucketSec) { $bucketSec = 604800 }
@@ -1323,6 +1626,7 @@ function Update-Visuals {
     $script:ChartStart = $cs; $script:BucketTicks = $bt; $script:BucketCount = $n
 
     $cnt = @{}; foreach ($lv in 1..4) { $cnt[$lv] = New-Object 'int[]' $n }
+    $levelTotals = New-Object 'int[]' 5
     $cells = @{}; $laneCounts = @{}; $groups = @{}
     $markers = New-Object System.Collections.Generic.List[object]
     $total = 0
@@ -1333,6 +1637,7 @@ function Update-Visuals {
         if ($b -lt 0 -or $b -ge $n) { continue }
         $lv = [int]$r['LevelNum']
         $cnt[$lv][$b]++
+        $levelTotals[$lv]++
         $total++
         $lane = Get-LaneKey $r
         $laneCounts[$lane] = 1 + [int]$laneCounts[$lane]
@@ -1352,6 +1657,7 @@ function Update-Visuals {
         $mk = [string]$r['Marker']
         if ($mk) { $markers.Add(@{ Time = $t; Kind = $mk; Computer = [string]$r['Computer']; Tag = $tag }) }
     }
+    foreach ($lv in 1..4) { $countLabels[$lv].Text = '{0} {1:N0} {2}' -f $bullet, $levelTotals[$lv], $levelNames[$lv] }
 
     # Stacked counts
     foreach ($lv in 1..4) {
@@ -1411,7 +1717,7 @@ function Update-Visuals {
     $span = $ce - $cs
     $caLanes.AxisX.LabelStyle.Format = if ($bucketSec -ge 86400) { 'dd MMM' } elseif ($span.TotalHours -gt 24) { 'dd MMM HH:mm' } elseif ($bucketSec -lt 60) { 'HH:mm:ss' } else { 'HH:mm' }
 
-    # Markers: reboots, SQL restarts, failovers... (de-duplicated per computer + kind)
+    # Markers: reboots, SQL restarts, failovers... (de-duplicated per computer + kind; hover for details)
     $gap = [math]::Max(300, $bucketSec)
     $last = @{}; $shown = New-Object System.Collections.Generic.List[object]
     foreach ($m in ($markers | Sort-Object { $_.Time })) {
@@ -1433,13 +1739,14 @@ function Update-Visuals {
     }
     foreach ($k in $kindsShown.Keys) {
         $li = New-Object System.Windows.Forms.DataVisualization.Charting.LegendItem
-        $li.Name = "Marker: $k"; $li.ImageStyle = [System.Windows.Forms.DataVisualization.Charting.LegendImageStyle]::Line
+        $li.Name = $k; $li.ImageStyle = [System.Windows.Forms.DataVisualization.Charting.LegendImageStyle]::Line
         $li.Color = $kindsShown[$k]; $li.BorderWidth = 2; $li.BorderDashStyle = [System.Windows.Forms.DataVisualization.Charting.ChartDashStyle]::Dash
         $legend.CustomItems.Add($li)
     }
 
-    $chartTitle.Text = ('{0:N0} events  |  {1:yyyy-MM-dd HH:mm} to {2:yyyy-MM-dd HH:mm} ({3})  |  {4} per bar  |  drag to zoom, click to drill in, right-click to zoom out' -f
-        $total, $script:ViewStart, $script:ViewEnd, (Format-Span ($script:ViewEnd - $script:ViewStart)), (Format-Span ([timespan]::FromSeconds($bucketSec))))
+    $chartTitle.Text = ('{0:N0} events   {1:ddd dd MMM HH:mm} - {2:ddd dd MMM HH:mm}  ({3}, {4} per bar){5}' -f
+        $total, $script:ViewStart, $script:ViewEnd, (Format-Span ($script:ViewEnd - $script:ViewStart)), (Format-Span ([timespan]::FromSeconds($bucketSec))),
+        $(if ($script:ZoomStack.Count) { '   [zoomed - right-click or Ctrl+- to zoom out]' } else { '' }))
 
     # Top issues
     $script:SummaryTable.BeginLoadData()
@@ -1455,10 +1762,9 @@ function Update-View {
         $mainForm.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
         $script:View.RowFilter = Get-RowFilter
         Update-Visuals
-        $msg = 'Showing {0:N0} of {1:N0} events' -f $script:View.Count, $script:Table.Rows.Count
-        if ($script:ViewStart) { $msg += ('  |  window {0:yyyy-MM-dd HH:mm:ss} to {1:yyyy-MM-dd HH:mm:ss}' -f $script:ViewStart, $script:ViewEnd) }
-        if ($script:ZoomStack.Count -gt 0) { $msg += '  (zoomed)' }
-        Update-StatusBar $msg
+        if ($script:Table.Rows.Count -gt 0) { Update-StatusBar ('Showing {0:N0} of {1:N0} events' -f $script:View.Count, $script:Table.Rows.Count) }
+        $tabSummary.Text = "Top issues ($($script:SummaryTable.Rows.Count))"
+        $tabEvents.Text = 'Events ({0:N0})' -f $script:View.Count
     } catch {
         Update-StatusBar "Filter error: $($_.Exception.Message)" -ErrorState
     } finally { $mainForm.Cursor = [System.Windows.Forms.Cursors]::Default }
@@ -1487,40 +1793,67 @@ function Set-ZoomToBucket([int]$Bucket) {
     Set-ViewWindow $from $to
 }
 
-function Set-ComboItems($Combo, [string[]]$Items) {
+function Set-ComboItems($Combo, [string]$AllText, [string[]]$Items) {
     $current = $Combo.SelectedItem
-    $Combo.Items.Clear(); [void]$Combo.Items.Add('(All)')
+    $Combo.Items.Clear(); [void]$Combo.Items.Add($AllText)
     foreach ($i in $Items) { [void]$Combo.Items.Add($i) }
     $idx = if ($current) { $Combo.Items.IndexOf($current) } else { 0 }
     $Combo.SelectedIndex = [math]::Max(0, $idx)
 }
-
-function Set-CollectingState([bool]$Busy) {
-    foreach ($c in $btnCollect, $txtComputers, $btnClusterNodes, $cmbRange, $dtpFrom, $dtpTo, $chkSrcSystem, $chkSrcApp, $chkSrcSql, $chkSrcSqlLogs,
-        $chkSrcCluster, $chkSrcHyperV, $chkSrcSecurity, $chkSrcOpsMgr, $chkIncludeInfo, $nudMax, $btnOpenCsv, $btnExportCsv, $btnHtml) { $c.Enabled = -not $Busy }
-    $btnCancel.Enabled = $Busy
+function Select-ComboItem($Combo, [string]$Value) {
+    $i = if ($Value) { $Combo.Items.IndexOf($Value) } else { 0 }
+    if ($i -ge 0) { $Combo.SelectedIndex = $i }
 }
 
-function Import-CollectedEvents($Events) {
+function Set-CollectingState([bool]$Busy) {
+    foreach ($c in $btnCollect, $txtComputers, $btnClusterNodes, $cmbRange, $hostFrom, $hostTo, $ddSources, $miOpen, $miAdd, $miSave, $miCollect) { $c.Enabled = -not $Busy }
+    $btnCancel.Enabled = $Busy
+    $progress.Visible = $Busy
+}
+
+function Get-DistinctValues([string]$Column) {
+    @($script:Table.DefaultView.ToTable($true, $Column).Rows | ForEach-Object { [string]$_[0] } | Where-Object { $_ } | Sort-Object)
+}
+
+function Import-CollectedEvents($Events, [switch]$Append) {
     $script:SuspendFilter = $true
     $script:Table.BeginLoadData()
-    $script:Table.Rows.Clear()
-    $key = 0
-    foreach ($e in ($Events | Sort-Object { [datetime]$_.Time })) {
+    $seenKeys = @{}
+    if ($Append) {
+        foreach ($r in $script:Table.Rows) { $seenKeys["$($r['Computer'])|$($r['LogName'])|$($r['RecordId'])|$(([datetime]$r['Time']).Ticks)|$($r['Id'])"] = $true }
+    } else { $script:Table.Rows.Clear() }
+    $key = $script:Table.Rows.Count
+    $skipped = 0
+    foreach ($e in $Events) {
+        $time = [datetime]$e.Time
+        if ($Append) {
+            $k = "$($e.Computer)|$($e.LogName)|$($e.RecordId)|$($time.Ticks)|$($e.Id)"
+            if ($seenKeys.ContainsKey($k)) { $skipped++; continue }
+            $seenKeys[$k] = $true
+        }
         $msg = [string]$e.Message
         $summary = $msg -replace '\s+', ' '
         if ($summary.Length -gt 400) { $summary = $summary.Substring(0, 400) + '...' }
-        [void]$script:Table.LoadDataRow([object[]]@($key, [datetime]$e.Time, [string]$e.Computer, [string]$e.Level, [int]$e.LevelNum, [string]$e.Category,
+        [void]$script:Table.LoadDataRow([object[]]@($key, $time, [string]$e.Computer, [string]$e.Level, [int]$e.LevelNum, [string]$e.Category,
                 [string]$e.Tag, [string]$e.Marker, [int]$e.Id, [string]$e.Provider, [string]$e.LogName, [string]$e.Source, [long]$e.RecordId, $summary, $msg), $true)
         $key++
     }
     $script:Table.EndLoadData()
-    Set-ComboItems $cmbCategory @($Events | ForEach-Object { [string]$_.Category } | Sort-Object -Unique)
-    Set-ComboItems $cmbComputer @($Events | ForEach-Object { [string]$_.Computer } | Sort-Object -Unique)
+    Set-ComboItems $cmbCategory 'All categories' (Get-DistinctValues 'Category')
+    Set-ComboItems $cmbComputer 'All computers' (Get-DistinctValues 'Computer')
     $script:SuspendFilter = $false
     $script:ZoomStack.Clear()
     $script:ViewStart = $script:CollectStart; $script:ViewEnd = $script:CollectEnd
     Update-View
+    return $skipped
+}
+
+function Set-RunLog([string[]]$Lines) {
+    $script:RunLog = @($Lines)
+    $txtRunLog.Lines = $script:RunLog
+    $problems = @($script:RunLog | Where-Object { $_ -match 'WARNING|ERROR|failed|not accessible|cannot|not readable' })
+    $tabLog.Text = if ($problems.Count) { "Collection log ($($problems.Count) warnings)" } else { 'Collection log' }
+    $tabLog.ForeColor = if ($problems.Count) { $levelColors[3] } else { $theme.ControlForeground }
 }
 
 function Get-DisplayedRows([switch]$IgnoreZoom) {
@@ -1530,13 +1863,270 @@ function Get-DisplayedRows([switch]$IgnoreZoom) {
 
 function Show-Error([string]$Title, [string]$Text) {
     Update-StatusBar $Text -ErrorState
-    [void][System.Windows.Forms.MessageBox]::Show($Text, $Title, 'OK', 'Error')
+    [void][System.Windows.Forms.MessageBox]::Show($mainForm, $Text, $Title, 'OK', 'Error')
+}
+
+function Update-SessionBanner {
+    if ($script:SessionFiles.Count) {
+        $names = ($script:SessionFiles | ForEach-Object { Split-Path $_ -Leaf }) -join ', '
+        $lblSession.Text = "Reviewing saved session: $names"
+        $lblSession.ToolTipText = ($script:SessionFiles -join "`n")
+        $mainForm.Text = "Windows Event Log Investigator - $names"
+    } else {
+        $lblSession.Text = if ($script:CollectedAt) { 'Live collection {0:yyyy-MM-dd HH:mm} from {1}' -f $script:CollectedAt, ($script:Computers -join ', ') } else { '' }
+        $lblSession.ToolTipText = ''
+        $mainForm.Text = 'Windows Event Log Investigator'
+    }
+}
+
+#---- Sessions ----
+function Get-ViewState {
+    $levels = @(); if ($chkCrit.Checked) { $levels += 1 }; if ($chkErr.Checked) { $levels += 2 }; if ($chkWarn.Checked) { $levels += 3 }; if ($chkInfo.Checked) { $levels += 4 }
+    [ordered]@{
+        viewStart = $script:ViewStart; viewEnd = $script:ViewEnd; levels = $levels
+        category = $(if ($cmbCategory.SelectedIndex -gt 0) { [string]$cmbCategory.SelectedItem } else { '' })
+        computer = $(if ($cmbComputer.SelectedIndex -gt 0) { [string]$cmbComputer.SelectedItem } else { '' })
+        lanes = [string]$cmbLanes.SelectedItem; eventIds = $txtIds.Text; search = $txtSearch.Text; tab = $script:CurrentTab
+    }
+}
+
+function Restore-ViewState($View) {
+    if (-not ($View -is [System.Collections.IDictionary])) { return }
+    $script:SuspendFilter = $true
+    $levels = @(Get-JsonValue $View 'levels' @(1, 2, 3, 4) | ForEach-Object { [int]$_ })
+    $chkCrit.Checked = 1 -in $levels; $chkErr.Checked = 2 -in $levels; $chkWarn.Checked = 3 -in $levels; $chkInfo.Checked = 4 -in $levels
+    Select-ComboItem $cmbCategory (Get-JsonValue $View 'category' '')
+    Select-ComboItem $cmbComputer (Get-JsonValue $View 'computer' '')
+    $lanes = Get-JsonValue $View 'lanes' ''; if ($lanes) { Select-ComboItem $cmbLanes $lanes }
+    $txtIds.Text = Get-JsonValue $View 'eventIds' ''
+    $txtSearch.Text = Get-JsonValue $View 'search' ''
+    $filterTimer.Stop()
+    $script:SuspendFilter = $false
+    $vs = ConvertFrom-SessionDate (Get-JsonValue $View 'viewStart'); $ve = ConvertFrom-SessionDate (Get-JsonValue $View 'viewEnd')
+    if ($vs -and $ve -and $ve -gt $vs -and ($vs -ne $script:CollectStart -or $ve -ne $script:CollectEnd)) {
+        $script:ZoomStack.Clear(); $script:ZoomStack.Push(@($script:CollectStart, $script:CollectEnd))
+        $script:ViewStart = $vs; $script:ViewEnd = $ve
+    }
+    Update-View
+    $tab = Get-JsonValue $View 'tab' ''; if ($tab -and $tabPages.ContainsKey($tab)) { Show-Tab $tab }
+}
+
+function Open-SessionFiles([string[]]$Paths, [switch]$Append) {
+    if (-not $Paths) { return }
+    if ($script:Jobs.Count) { Show-Error 'Open session' 'Wait for the current collection to finish (or cancel it) first.'; return }
+    $mainForm.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    try {
+        $loaded = @()
+        foreach ($p in $Paths) { Update-StatusBar "Reading $(Split-Path $p -Leaf)..."; $loaded += Read-InvestigationSession $p }
+        $events = New-Object System.Collections.Generic.List[object]
+        $log = New-Object System.Collections.Generic.List[string]
+        if ($Append) { foreach ($l in $script:RunLog) { $log.Add($l) } }
+        $starts = @(); $ends = @(); $comps = @(); $srcs = @(); $offsets = @()
+        if ($Append -and $script:CollectStart) { $starts += $script:CollectStart; $ends += $script:CollectEnd; $comps += $script:Computers; $srcs += $script:CollectSources }
+        foreach ($s in $loaded) {
+            $doc = $s.Document; $col = Get-JsonValue $doc 'collection'
+            $starts += ConvertFrom-SessionDate (Get-JsonValue $col 'start'); $ends += ConvertFrom-SessionDate (Get-JsonValue $col 'end')
+            $comps += @(Get-JsonValue $col 'computers' @() | ForEach-Object { [string]$_ })
+            $srcs += @(Get-JsonValue $col 'sources' @() | ForEach-Object { [string]$_ })
+            $off = Get-JsonValue $col 'utcOffsetMinutes'; if ($null -ne $off) { $offsets += [int]$off }
+            $log.Add(('==== Session {0}: exported {1} from {2} by {3} ====' -f (Split-Path $s.Path -Leaf), (ConvertFrom-SessionDate (Get-JsonValue $doc 'exportedAt')),
+                    (Get-JsonValue $doc 'exportedFrom' '?'), (Get-JsonValue $doc 'exportedBy' '?')))
+            foreach ($l in @(Get-JsonValue $doc 'runLog' @())) { $log.Add([string]$l) }
+            $events.AddRange([object[]]$s.Events)
+        }
+        $script:CollectStart = ($starts | Measure-Object -Minimum).Minimum
+        $script:CollectEnd = ($ends | Measure-Object -Maximum).Maximum
+        $script:Computers = @($comps | Sort-Object -Unique)
+        $script:CollectSources = @($srcs | Sort-Object -Unique)
+        $first = Get-JsonValue $loaded[0].Document 'collection'
+        $script:CollectedAt = ConvertFrom-SessionDate (Get-JsonValue $first 'collectedAt')
+        $script:CollectedOn = Get-JsonValue $first 'collectedOn'
+        $script:CollectIncludeInfo = [bool](Get-JsonValue $first 'includeInformation' $false)
+        $script:CollectMax = [int](Get-JsonValue $first 'maxEventsPerQuery' $MaxEventsPerQuery)
+        $script:UtcOffsetMinutes = if ($offsets) { $offsets[0] } else { $null }
+        $previous = @(if ($Append) { $script:SessionFiles })
+        $script:SessionFiles = @($previous + @($Paths) | Select-Object -Unique)
+
+        # Reflect the loaded collection in the collection bar so it can be re-run against the servers if they are reachable
+        $txtComputers.Text = $script:Computers -join ', '
+        Set-CustomRange $script:CollectStart $script:CollectEnd
+        foreach ($def in $sourceDefs) { $sourceItems[$def.Key].Checked = ($def.Key -in $script:CollectSources) }
+        $miIncludeInfo.Checked = $script:CollectIncludeInfo; $cmbMax.Text = [string]$script:CollectMax
+        Update-SourcesButton
+
+        Set-RunLog $log.ToArray()
+        $skipped = Import-CollectedEvents $events -Append:$Append
+        if (-not $Append -and $loaded.Count -eq 1) { Restore-ViewState (Get-JsonValue $loaded[0].Document 'view') }
+        Update-SessionBanner
+        $msg = 'Loaded {0:N0} events from {1} session file(s)' -f ($events.Count - $skipped), $loaded.Count
+        if ($skipped) { $msg += " ($skipped duplicates skipped)" }
+        $localOffset = [int][TimeZoneInfo]::Local.GetUtcOffset($script:CollectStart).TotalMinutes
+        if ($null -ne $script:UtcOffsetMinutes -and $script:UtcOffsetMinutes -ne $localOffset) {
+            $msg += '  |  times are the source server''s local time (UTC{0}{1:hh\:mm})' -f $(if ($script:UtcOffsetMinutes -lt 0) { '-' } else { '+' }), [timespan]::FromMinutes([math]::Abs($script:UtcOffsetMinutes))
+        }
+        Update-StatusBar $msg
+    } catch {
+        Show-Error 'Open session' "Could not open session: $($_.Exception.Message)"
+    } finally { $mainForm.Cursor = [System.Windows.Forms.Cursors]::Default }
+}
+
+function Save-SessionFile {
+    if ($script:Table.Rows.Count -eq 0 -and -not $script:RunLog) { Update-StatusBar 'Nothing to save yet - collect or open some events first.'; return }
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Filter = 'Event Log Investigator session (*.json)|*.json'; $dlg.Title = 'Save session (all events, collection log, filters and zoom)'
+    $dlg.FileName = Get-SessionFileName $script:Computers
+    if ($dlg.ShowDialog($mainForm) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    $mainForm.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    try {
+        $collection = [ordered]@{
+            start = $script:CollectStart; end = $script:CollectEnd; computers = $script:Computers; sources = $script:CollectSources
+            includeInformation = $script:CollectIncludeInfo; maxEventsPerQuery = $script:CollectMax
+            collectedAt = $script:CollectedAt; collectedOn = $script:CollectedOn
+            utcOffsetMinutes = $(if ($null -ne $script:UtcOffsetMinutes) { $script:UtcOffsetMinutes } elseif ($script:CollectStart) { [int][TimeZoneInfo]::Local.GetUtcOffset($script:CollectStart).TotalMinutes } else { $null })
+        }
+        Export-InvestigationSession -Rows $script:Table.Select('', 'Time ASC') -Path $dlg.FileName -Collection $collection -View (Get-ViewState) -RunLog $script:RunLog
+        $size = (Get-Item $dlg.FileName).Length / 1MB
+        Update-StatusBar ('Session saved: {0} ({1:N0} events, {2:N1} MB)' -f $dlg.FileName, $script:Table.Rows.Count, $size)
+    } catch { Show-Error 'Save session' "Could not save session: $($_.Exception.Message)" }
+    finally { $mainForm.Cursor = [System.Windows.Forms.Cursors]::Default }
+}
+
+function Select-SessionFiles([string]$Title) {
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Filter = 'Event Log Investigator session (*.json)|*.json|All files (*.*)|*.*'; $dlg.Multiselect = $true; $dlg.Title = $Title
+    if ($dlg.ShowDialog($mainForm) -eq [System.Windows.Forms.DialogResult]::OK) { return , $dlg.FileNames }
+    return $null
+}
+
+#---- Exports ----
+function Save-DisplayedCsv {
+    $rows = Get-DisplayedRows
+    if ($rows.Count -eq 0) { Update-StatusBar 'No data to export.'; return }
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'; $dlg.Title = 'Export displayed events'
+    $dlg.FileName = "EventLogInvestigation_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+    if ($dlg.ShowDialog($mainForm) -eq [System.Windows.Forms.DialogResult]::OK) {
+        try { Export-EventCsv $rows $dlg.FileName; Update-StatusBar "$($rows.Count) events exported to $($dlg.FileName)" }
+        catch { Show-Error 'Export' "Error exporting data: $($_.Exception.Message)" }
+    }
+}
+function Open-DisplayedInExcel {
+    $rows = Get-DisplayedRows
+    if ($rows.Count -eq 0) { Update-StatusBar 'No data to export.'; return }
+    $path = Join-Path $env:TEMP "EventLogInvestigation_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+    try { Export-EventCsv $rows $path; Invoke-Item $path; Update-StatusBar "Opened $path" }
+    catch { Show-Error 'Export' "Error exporting or opening data: $($_.Exception.Message)" }
+}
+function Save-HtmlReport {
+    if ($script:Table.Rows.Count -eq 0) { Update-StatusBar 'Collect or open some events first.'; return }
+    $rows = Get-DisplayedRows -IgnoreZoom
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Filter = 'HTML report (*.html)|*.html'; $dlg.Title = 'Save interactive HTML report'
+    $dlg.FileName = "EventLogInvestigation_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
+    if ($dlg.ShowDialog($mainForm) -eq [System.Windows.Forms.DialogResult]::OK) {
+        try {
+            $mainForm.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+            New-HtmlReport -Rows $rows -Path $dlg.FileName -Start $script:CollectStart -End $script:CollectEnd -Computers $script:Computers -RunLog $script:RunLog
+            Update-StatusBar "HTML report saved to $($dlg.FileName)"
+            Invoke-Item $dlg.FileName
+        } catch { Show-Error 'HTML report' "Error creating report: $($_.Exception.Message)" }
+        finally { $mainForm.Cursor = [System.Windows.Forms.Cursors]::Default }
+    }
+}
+
+#---- Collection ----
+function Start-Collection {
+    if (-not $btnCollect.Enabled) { return }
+    $computers = @($txtComputers.Text -split '[,;\s]+' | Where-Object { $_ } | Select-Object -Unique)
+    if (-not $computers) { $computers = @($env:COMPUTERNAME); $txtComputers.Text = $env:COMPUTERNAME }
+    if ($timeFrames[$cmbRange.SelectedIndex].Hours -gt 0) { Set-RangeFromPreset }
+    $from = $dtpFrom.Value; $to = $dtpTo.Value
+    if ($from -ge $to) { Show-Error 'Time range' "'From' must be earlier than 'To'."; return }
+    $srcs = Get-SelectedSources
+    if (-not $srcs) { Show-Error 'Sources' 'Select at least one source to collect (Sources drop-down).'; return }
+    $max = 0; if (-not [int]::TryParse($cmbMax.Text, [ref]$max) -or $max -lt 100) { $max = 5000; $cmbMax.Text = '5000' }
+
+    $script:CollectStart = $from; $script:CollectEnd = $to; $script:Computers = $computers
+    $script:CollectSources = $srcs; $script:CollectIncludeInfo = $miIncludeInfo.Checked; $script:CollectMax = $max
+    $script:CollectedAt = Get-Date; $script:CollectedOn = $env:COMPUTERNAME
+    $script:UtcOffsetMinutes = [int][TimeZoneInfo]::Local.GetUtcOffset($from).TotalMinutes
+    $script:SessionFiles = @()
+    Set-RunLog @()
+    Set-CollectingState $true
+    $script:Jobs = @(foreach ($c in $computers) {
+        Start-Job -Name "EventLog_$c" -ScriptBlock $Collector -ArgumentList $c, $from, $to, $srcs, $max, $miIncludeInfo.Checked
+    })
+    Update-StatusBar "Collecting from $($computers -join ', ')..."
+    $pollTimer.Start()
+}
+
+function Show-Tips {
+    $tips = @"
+COLLECT
+  Enter one or more computers (or '+ Cluster nodes'), pick a range and the sources, then Collect (F5).
+  Every computer is collected in parallel. The Collection log tab shows what was queried and any problems.
+
+TIMELINE
+  Bars: events per time bucket by level.  Lanes: where they came from (Lanes: Category / Computer / Provider).
+  Dashed lines: reboots, crashes, SQL restarts, failovers, AG changes, patching - hover for details.
+  Drag to zoom  |  click a bar to drill in  |  click a dot to drill in and filter to that lane  |  right-click / Ctrl+- to zoom out  |  Ctrl+0 to reset.
+
+FILTER
+  Level toggles, category, computer, Event IDs ('1069 1135', '-7036' to exclude) and Search (Ctrl+F).
+  Top issues groups events by provider + ID - double-click one to see those events.
+  Right-click an event to filter / exclude its ID or zoom to +/- 15 minutes around it.
+
+SHARE
+  File > Save session (Ctrl+S) writes everything - all events with full messages, the collection log,
+  the settings and your current filters / zoom - to one .json file.
+  File > Open session (Ctrl+O), drag and drop, or -SessionPath opens it on any machine, no server access needed.
+  File > Add session merges more files (e.g. one per cluster node).
+  Collect on a server without the GUI:  .\WinEventLogInvestigator.ps1 -NoGui -OutputPath C:\Temp\RCA
+  Also: CSV (Ctrl+E), Excel, and a self-contained interactive HTML report (Ctrl+H).
+"@
+    [void][System.Windows.Forms.MessageBox]::Show($mainForm, $tips, 'How to use', 'OK', 'Information')
 }
 
 #---- Event handlers ----
-$cmbRange.Add_SelectedIndexChanged({ Set-RangeFromPreset })
-$dtpFrom.Add_ValueChanged({ if (-not $script:SettingRange) { $cmbRange.SelectedIndex = $timeFrames.Count - 1 } })
-$dtpTo.Add_ValueChanged({ if (-not $script:SettingRange) { $cmbRange.SelectedIndex = $timeFrames.Count - 1 } })
+$miOpen.Add_Click({ $f = Select-SessionFiles 'Open session file(s)'; if ($f) { Open-SessionFiles $f } })
+$miAdd.Add_Click({ $f = Select-SessionFiles 'Add session file(s) to the current view'; if ($f) { Open-SessionFiles $f -Append:($script:Table.Rows.Count -gt 0) } })
+$miSave.Add_Click({ Save-SessionFile })
+$miCsv.Add_Click({ Save-DisplayedCsv })
+$miExport.Add_Click({ Save-DisplayedCsv })
+$miExcel.Add_Click({ Open-DisplayedInExcel })
+$miHtml.Add_Click({ Save-HtmlReport })
+$miExit.Add_Click({ $mainForm.Close() })
+$miCollect.Add_Click({ Start-Collection })
+$miFind.Add_Click({ $txtSearch.Focus(); $txtSearch.SelectAll() })
+$miZoomOut.Add_Click({ Undo-Zoom })
+$miResetZoom.Add_Click({ Reset-Zoom })
+$miShowCollect.Add_CheckedChanged({ $tsCollect.Visible = $miShowCollect.Checked })
+$miShowDetail.Add_CheckedChanged({ $splitEvents.Panel2Collapsed = -not $miShowDetail.Checked })
+$miTips.Add_Click({ Show-Tips })
+$tabEvents.Add_Click({ Show-Tab 'Events' })
+$tabSummary.Add_Click({ Show-Tab 'Summary' })
+$tabLog.Add_Click({ Show-Tab 'Log' })
+foreach ($mi in $sourceItems.Values) { $mi.Add_CheckedChanged({ Update-SourcesButton }) }
+$miIncludeInfo.Add_CheckedChanged({ Update-SourcesButton })
+
+$mainForm.Add_DragEnter({
+    param($s, $e)
+    if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { $e.Effect = [System.Windows.Forms.DragDropEffects]::Copy }
+})
+$mainForm.Add_DragDrop({
+    param($s, $e)
+    $files = @($e.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop) | Where-Object { $_ -like '*.json' })
+    if ($files) { Open-SessionFiles $files -Append:([System.Windows.Forms.Control]::ModifierKeys -band [System.Windows.Forms.Keys]::Shift) }
+})
+foreach ($c in $chart, $dgvEvents, $dgvSummary) {
+    $c.AllowDrop = $true
+    $c.Add_DragEnter({ param($s, $e) if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { $e.Effect = [System.Windows.Forms.DragDropEffects]::Copy } })
+    $c.Add_DragDrop({ param($s, $e) $files = @($e.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop) | Where-Object { $_ -like '*.json' }); if ($files) { Open-SessionFiles $files } })
+}
+
+$cmbRange.Add_SelectedIndexChanged({ if (-not $script:SettingRange) { Set-RangeFromPreset } })
+$dtpFrom.Add_ValueChanged({ if (-not $script:SettingRange) { $script:SettingRange = $true; $cmbRange.SelectedIndex = $timeFrames.Count - 1; $script:SettingRange = $false } })
+$dtpTo.Add_ValueChanged({ if (-not $script:SettingRange) { $script:SettingRange = $true; $cmbRange.SelectedIndex = $timeFrames.Count - 1; $script:SettingRange = $false } })
 
 $btnClusterNodes.Add_Click({
     $first = @($txtComputers.Text -split '[,;\s]+' | Where-Object { $_ }) | Select-Object -First 1
@@ -1563,29 +2153,7 @@ $btnClusterNodes.Add_Click({
     }
 })
 
-$btnCollect.Add_Click({
-    $computers = @($txtComputers.Text -split '[,;\s]+' | Where-Object { $_ } | Select-Object -Unique)
-    if (-not $computers) { $computers = @($env:COMPUTERNAME); $txtComputers.Text = $env:COMPUTERNAME }
-    if ($timeFrames[$cmbRange.SelectedIndex].Hours -gt 0) { Set-RangeFromPreset }
-    $from = $dtpFrom.Value; $to = $dtpTo.Value
-    if ($from -ge $to) { Show-Error 'Time range' "'From' must be earlier than 'To'."; return }
-    $srcs = @()
-    if ($chkSrcSystem.Checked) { $srcs += 'System' }; if ($chkSrcApp.Checked) { $srcs += 'Application' }
-    if ($chkSrcSql.Checked) { $srcs += 'SQL' }; if ($chkSrcSqlLogs.Checked) { $srcs += 'SQLLogs' }
-    if ($chkSrcCluster.Checked) { $srcs += 'Cluster' }; if ($chkSrcHyperV.Checked) { $srcs += 'HyperV' }
-    if ($chkSrcSecurity.Checked) { $srcs += 'Security' }; if ($chkSrcOpsMgr.Checked) { $srcs += 'OpsMgr' }
-    if (-not $srcs) { Show-Error 'Sources' 'Select at least one source to collect.'; return }
-
-    $script:CollectStart = $from; $script:CollectEnd = $to; $script:Computers = $computers
-    $script:RunLog = @()
-    $txtRunLog.Text = ''
-    Set-CollectingState $true
-    $script:Jobs = @(foreach ($c in $computers) {
-        Start-Job -Name "EventLog_$c" -ScriptBlock $Collector -ArgumentList $c, $from, $to, $srcs, ([int]$nudMax.Value), $chkIncludeInfo.Checked
-    })
-    Update-StatusBar "Collecting from $($computers -join ', ')..."
-    $pollTimer.Start()
-})
+$btnCollect.Add_Click({ Start-Collection })
 
 $btnCancel.Add_Click({
     $pollTimer.Stop()
@@ -1627,13 +2195,12 @@ $pollTimer.Add_Tick({
         Remove-Job $j -Force
     }
     $script:Jobs = @()
-    $script:RunLog = $log.ToArray()
-    $txtRunLog.Lines = $script:RunLog
+    Set-RunLog $log.ToArray()
     Set-CollectingState $false
-    Import-CollectedEvents $events
+    [void](Import-CollectedEvents ($events | Sort-Object { [datetime]$_.Time }))
+    Update-SessionBanner
     if ($events.Count -eq 0) { Update-StatusBar 'No events found for the selected range and sources - see the Collection log tab.' }
-    $problems = @($script:RunLog | Where-Object { $_ -match 'WARNING|ERROR|failed|not accessible|cannot' })
-    if ($problems.Count) { $tabLog.Text = "Collection log ($($problems.Count) warnings)" } else { $tabLog.Text = 'Collection log' }
+    else { Update-StatusBar ('Collected {0:N0} events from {1}. File > Save session (Ctrl+S) to review them on another machine.' -f $events.Count, ($script:Computers -join ', ')) }
 })
 
 # Chart interaction
@@ -1659,9 +2226,9 @@ $chart.Add_MouseClick({
         $lane = $parts[1]
         $script:SuspendFilter = $true
         switch ($cmbLanes.SelectedIndex) {
-            0 { $i = $cmbCategory.Items.IndexOf($lane); if ($i -ge 0) { $cmbCategory.SelectedIndex = $i } }
-            1 { $i = $cmbComputer.Items.IndexOf($lane); if ($i -ge 0) { $cmbComputer.SelectedIndex = $i } }
-            2 { $cp = $lane -split ' \| ', 2; $i = $cmbComputer.Items.IndexOf($cp[0]); if ($i -ge 0) { $cmbComputer.SelectedIndex = $i }; $i = $cmbCategory.Items.IndexOf($cp[1]); if ($i -ge 0) { $cmbCategory.SelectedIndex = $i } }
+            0 { Select-ComboItem $cmbCategory $lane }
+            1 { Select-ComboItem $cmbComputer $lane }
+            2 { $cp = $lane -split ' \| ', 2; Select-ComboItem $cmbComputer $cp[0]; Select-ComboItem $cmbCategory $cp[1] }
             3 { $txtSearch.Text = $lane; $filterTimer.Stop() }
         }
         $script:SuspendFilter = $false
@@ -1679,26 +2246,29 @@ $chart.Add_MouseClick({
 foreach ($c in $chkCrit, $chkErr, $chkWarn, $chkInfo) { $c.Add_CheckedChanged({ Update-View }) }
 foreach ($c in $cmbCategory, $cmbComputer, $cmbLanes) { $c.Add_SelectedIndexChanged({ Update-View }) }
 foreach ($t in $txtIds, $txtSearch) { $t.Add_TextChanged({ $filterTimer.Stop(); $filterTimer.Start() }) }
+$txtSearch.Add_KeyDown({ param($s, $e) if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $txtSearch.Text = '' } })
 $filterTimer.Add_Tick({ $filterTimer.Stop(); Update-View })
-$btnClearFilter.Add_Click({
+$clearFilters = {
     $script:SuspendFilter = $true
     $txtIds.Text = ''; $txtSearch.Text = ''; $cmbCategory.SelectedIndex = 0; $cmbComputer.SelectedIndex = 0
     foreach ($c in $chkCrit, $chkErr, $chkWarn, $chkInfo) { $c.Checked = $true }
     $script:SuspendFilter = $false
     $filterTimer.Stop()
     Update-View
-})
+}
+$btnClearFilter.Add_Click($clearFilters)
+$miClearFilters.Add_Click($clearFilters)
 $btnZoomOut.Add_Click({ Undo-Zoom })
 $btnResetZoom.Add_Click({ Reset-Zoom })
 
-# Grid
+# Grids
 $dgvEvents.Add_SelectionChanged({
     $row = $dgvEvents.CurrentRow
     if (-not $row -or -not $row.DataBoundItem) { return }
     $r = $row.DataBoundItem.Row
-    $txtDetail.Text = (("Time:      {0:yyyy-MM-dd HH:mm:ss.fff}`r`nComputer:  {1}`r`nLevel:     {2}`r`nCategory:  {3}`r`nDescribed: {4}`r`nLog:       {5}`r`nProvider:  {6}`r`nEvent ID:  {7}`r`nSource:    {8}`r`n" -f
-        $r['Time'], $r['Computer'], $r['Level'], $r['Category'], $r['Tag'], $r['LogName'], $r['Provider'], $r['Id'], $r['Source']) +
-        ('-' * 80) + "`r`n" + ([string]$r['Message'] -replace '(?<!\r)\n', "`r`n"))
+    $txtDetail.Text = (("{0:yyyy-MM-dd HH:mm:ss.fff}   {1}   {2}`r`n{3}  |  {4}  |  Event ID {5}`r`n{6}  ({7})`r`n" -f
+        $r['Time'], $r['Computer'], $r['Level'], $r['Category'], $r['Provider'], $r['Id'], $(if ($r['Tag']) { $r['Tag'] } else { '-' }), $r['LogName']) +
+        "`r`n" + ([string]$r['Message'] -replace '(?<!\r)\n', "`r`n"))
 })
 $dgvEvents.Add_CellFormatting({
     param($s, $e)
@@ -1722,15 +2292,13 @@ $dgvSummary.Add_CellDoubleClick({
     if ($e.RowIndex -lt 0) { return }
     $r = $dgvSummary.Rows[$e.RowIndex].DataBoundItem.Row
     $script:SuspendFilter = $true
-    $i = $cmbCategory.Items.IndexOf([string]$r['Category']); if ($i -ge 0) { $cmbCategory.SelectedIndex = $i }
+    Select-ComboItem $cmbCategory ([string]$r['Category'])
     $txtIds.Text = [string]$r['Id']
     $script:SuspendFilter = $false
     $filterTimer.Stop()
     Update-View
-    $tabs.SelectedTab = $tabEvents
+    Show-Tab 'Events'
 })
-$toolTip.SetToolTip($dgvSummary, 'Double-click a row to show those events.')
-
 $dgvEvents.Add_CellMouseDown({
     param($s, $e)
     if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Right -and $e.RowIndex -ge 0 -and -not $dgvEvents.Rows[$e.RowIndex].Selected) {
@@ -1745,65 +2313,28 @@ $miAround.Add_Click({
     if ($dgvEvents.CurrentRow) { $t = [datetime]$dgvEvents.CurrentRow.DataBoundItem['Time']; Set-ViewWindow $t.AddMinutes(-15) $t.AddMinutes(15) }
 })
 
-# Export
-function Save-DisplayedCsv {
-    $rows = Get-DisplayedRows
-    if ($rows.Count -eq 0) { Update-StatusBar 'No data to export.'; return }
-    $dlg = New-Object System.Windows.Forms.SaveFileDialog
-    $dlg.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'; $dlg.Title = 'Export displayed events'
-    $dlg.FileName = "EventLogInvestigation_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-        try { Export-EventCsv $rows $dlg.FileName; Update-StatusBar "$($rows.Count) events exported to $($dlg.FileName)" }
-        catch { Show-Error 'Export' "Error exporting data: $($_.Exception.Message)" }
-    }
-}
-$btnExportCsv.Add_Click({ Save-DisplayedCsv })
-$miExport.Add_Click({ Save-DisplayedCsv })
-$btnOpenCsv.Add_Click({
-    $rows = Get-DisplayedRows
-    if ($rows.Count -eq 0) { Update-StatusBar 'No data to export.'; return }
-    $path = Join-Path $env:TEMP "EventLogInvestigation_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-    try { Export-EventCsv $rows $path; Invoke-Item $path; Update-StatusBar "Opened $path" }
-    catch { Show-Error 'Export' "Error exporting or opening data: $($_.Exception.Message)" }
-})
-$btnHtml.Add_Click({
-    if ($script:Table.Rows.Count -eq 0) { Update-StatusBar 'Collect some events first.'; return }
-    $rows = Get-DisplayedRows -IgnoreZoom
-    $dlg = New-Object System.Windows.Forms.SaveFileDialog
-    $dlg.Filter = 'HTML report (*.html)|*.html'; $dlg.Title = 'Save interactive HTML report'
-    $dlg.FileName = "EventLogInvestigation_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
-    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-        try {
-            $mainForm.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-            New-HtmlReport -Rows $rows -Path $dlg.FileName -Start $script:CollectStart -End $script:CollectEnd -Computers $script:Computers -RunLog $script:RunLog
-            Update-StatusBar "HTML report saved to $($dlg.FileName)"
-            Invoke-Item $dlg.FileName
-        } catch { Show-Error 'HTML report' "Error creating report: $($_.Exception.Message)" }
-        finally { $mainForm.Cursor = [System.Windows.Forms.Cursors]::Default }
-    }
-})
-
 $mainForm.Add_Shown({
-    $splitMain.SplitterDistance = [int]($splitMain.Height * 0.45)
-    $splitEvents.SplitterDistance = [int]($splitEvents.Height * 0.72)
+    $splitMain.SplitterDistance = [int]($splitMain.Height * 0.46)
+    $splitEvents.SplitterDistance = [int]($splitEvents.Height * 0.70)
     $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    if (-not $isAdmin) { Update-StatusBar 'Not running as Administrator - the Security log and SQL ERRORLOG files may be inaccessible.' -ErrorState }
-    if ($AutoRun) { $btnCollect.PerformClick() }
+    if (-not $isAdmin) { Update-StatusBar 'Not running as Administrator - the Security log and SQL ERRORLOG files may be inaccessible when collecting.' -ErrorState }
+    if ($SessionPath) { Open-SessionFiles $SessionPath }
+    elseif ($AutoRun) { Start-Collection }
 })
 $mainForm.Add_FormClosing({
     $pollTimer.Stop(); $filterTimer.Stop()
     foreach ($j in $script:Jobs) { try { Stop-Job $j; Remove-Job $j -Force } catch { } }
 })
 
-# Initial time range
-$script:Computers = $ComputerName
+# Initial state
+Show-Tab 'Events'
+Update-SourcesButton
+Set-RunLog @()
 if ($PSBoundParameters.ContainsKey('StartTime') -or $PSBoundParameters.ContainsKey('EndTime')) {
-    $cmbRange.SelectedIndex = $timeFrames.Count - 1
-    $script:SettingRange = $true; $dtpFrom.Value = $StartTime; $dtpTo.Value = $EndTime; $script:SettingRange = $false
+    Set-CustomRange $StartTime $EndTime
 } else {
     $preset = [array]::IndexOf(@($timeFrames | ForEach-Object { $_.Hours }), $Hours)
-    if ($preset -ge 0) { $cmbRange.SelectedIndex = $preset }
-    else { $cmbRange.SelectedIndex = $timeFrames.Count - 1; $script:SettingRange = $true; $dtpFrom.Value = $StartTime; $dtpTo.Value = $EndTime; $script:SettingRange = $false }
+    if ($preset -ge 0) { $cmbRange.SelectedIndex = $preset } else { Set-CustomRange $StartTime $EndTime }
 }
 
 [void]$mainForm.ShowDialog()
