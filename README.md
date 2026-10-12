@@ -45,8 +45,8 @@ and how many hosts are affected. Double-click a row to see those events.
 
 ![Top issues tab](docs/screenshots/top-issues.png)
 
-**HTML report.** One self-contained file with the same timeline, KPIs, top issues and a searchable events table,
-for attaching to an incident ticket.
+**HTML report.** Click **View HTML report** (Ctrl+R) to open it in your browser, or use File > Save HTML report to keep a copy.
+It's one self-contained file with the same timeline, KPIs, top issues and a searchable events table, for attaching to an incident ticket.
 
 <img src="docs/screenshots/html-report.png" alt="Interactive HTML report" width="600">
 
@@ -102,8 +102,9 @@ Times are kept as the source server's local time. When the reviewer is in a diff
 * **Tabs:** *Events* (grid plus a details pane with the full message), *Top issues* and *Collection log*. The status bar shows
   counts per level for the current view.
 * Right-click an event to show only or exclude its Event ID, or to zoom the timeline to ±15 minutes around it.
-* **Exports:** CSV and Open in Excel export exactly what is displayed (filters and zoom). The HTML report applies the filters
-  but keeps the full time range, with its own zoom. Save session stores every event plus the current view.
+* **Quick actions** at the right of the tab strip: **View HTML report** opens the report straight in your browser, and **Open in Excel**.
+* **Exports:** CSV and Open in Excel export exactly what is displayed (filters and zoom). The HTML report (view or save) applies the
+  filters but keeps the full time range, with its own zoom. Save session stores every event plus the current view.
 * **View menu:** hide the collection bar or the details pane to give the timeline and grid more room. Help > How to use (F1).
 
 | Shortcut | |
@@ -113,7 +114,8 @@ Times are kept as the source server's local time. When the reviewer is in a diff
 | Ctrl+F, Esc | Search, clear search |
 | Ctrl+- / Ctrl+0 | Zoom out / reset zoom |
 | Ctrl+Shift+X | Clear filters |
-| Ctrl+E / Ctrl+H | Export CSV / HTML report |
+| Ctrl+R | View HTML report in your browser |
+| Ctrl+E / Ctrl+H | Save CSV / save HTML report |
 | F1 | How to use |
 
 ## Command line

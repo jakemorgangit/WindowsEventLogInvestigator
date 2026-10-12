@@ -1275,9 +1275,10 @@ $miAdd.ToolTipText = 'Add more session files to what is loaded, e.g. one exporte
 $miSave = New-MenuItem '&Save session...' ([System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::S)
 $miCsv = New-MenuItem 'Export displayed events to &CSV...' ([System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::E)
 $miExcel = New-MenuItem 'Open displayed events in &Excel'
+$miViewHtml = New-MenuItem '&View HTML report in browser' ([System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::R)
 $miHtml = New-MenuItem 'Save &HTML report...' ([System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::H)
 $miExit = New-MenuItem 'E&xit'
-[void]$mnuFile.DropDownItems.AddRange(@($miOpen, $miAdd, $miSave, (New-Object System.Windows.Forms.ToolStripSeparator), $miCsv, $miExcel, $miHtml,
+[void]$mnuFile.DropDownItems.AddRange(@($miOpen, $miAdd, $miSave, (New-Object System.Windows.Forms.ToolStripSeparator), $miCsv, $miExcel, $miViewHtml, $miHtml,
         (New-Object System.Windows.Forms.ToolStripSeparator), $miExit))
 $mnuView = New-MenuItem '&View'
 $miCollect = New-MenuItem '&Collect now' ([System.Windows.Forms.Keys]::F5)
@@ -1474,7 +1475,13 @@ $tabSummary = New-TsButton 'Top issues'
 $tabLog = New-TsButton 'Collection log'
 $lblSession = New-TsLabel '' -Muted
 $lblSession.Alignment = [System.Windows.Forms.ToolStripItemAlignment]::Right
-[void]$tsTabs.Items.AddRange(@($tabEvents, $tabSummary, $tabLog, $lblSession))
+# Quick actions on the right of the tab strip (right-aligned items are laid out right to left)
+$btnViewHtml = New-TsButton 'View HTML report' 'Open the interactive HTML report in your browser (Ctrl+R). Uses the current filters; File > Save HTML report keeps a copy.'
+$btnExcel = New-TsButton 'Open in Excel' 'Open the displayed events in Excel'
+foreach ($b in $btnViewHtml, $btnExcel) { $b.Alignment = [System.Windows.Forms.ToolStripItemAlignment]::Right; $b.ForeColor = [System.Drawing.Color]::FromArgb(110, 180, 245) }
+$sepQuick = New-Object System.Windows.Forms.ToolStripSeparator
+$sepQuick.Alignment = [System.Windows.Forms.ToolStripItemAlignment]::Right
+[void]$tsTabs.Items.AddRange(@($tabEvents, $tabSummary, $tabLog, $btnViewHtml, $btnExcel, $sepQuick, $lblSession))
 $pnlContent = New-Object System.Windows.Forms.Panel
 $pnlContent.Dock = [System.Windows.Forms.DockStyle]::Fill; $pnlContent.BackColor = $theme.GridBackground
 $pnlLog = New-Object System.Windows.Forms.Panel
@@ -2027,20 +2034,28 @@ function Open-DisplayedInExcel {
     try { Export-EventCsv $rows $path; Invoke-Item $path; Update-StatusBar "Opened $path" }
     catch { Show-Error 'Export' "Error exporting or opening data: $($_.Exception.Message)" }
 }
+# Builds the HTML report (current filters, full time range) at $Path and opens it in the default browser
+function Write-HtmlReportAndOpen([string]$Path) {
+    try {
+        $mainForm.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        New-HtmlReport -Rows (Get-DisplayedRows -IgnoreZoom) -Path $Path -Start $script:CollectStart -End $script:CollectEnd -Computers $script:Computers -RunLog $script:RunLog
+        Invoke-Item $Path
+        return $true
+    } catch { Show-Error 'HTML report' "Error creating report: $($_.Exception.Message)"; return $false }
+    finally { $mainForm.Cursor = [System.Windows.Forms.Cursors]::Default }
+}
+function Show-HtmlReport {
+    if ($script:Table.Rows.Count -eq 0) { Update-StatusBar 'Collect or open some events first.'; return }
+    $path = Join-Path $env:TEMP "EventLogInvestigation_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
+    if (Write-HtmlReportAndOpen $path) { Update-StatusBar "HTML report opened in your browser ($path). File > Save HTML report keeps a copy." }
+}
 function Save-HtmlReport {
     if ($script:Table.Rows.Count -eq 0) { Update-StatusBar 'Collect or open some events first.'; return }
-    $rows = Get-DisplayedRows -IgnoreZoom
     $dlg = New-Object System.Windows.Forms.SaveFileDialog
     $dlg.Filter = 'HTML report (*.html)|*.html'; $dlg.Title = 'Save interactive HTML report'
     $dlg.FileName = "EventLogInvestigation_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
     if ($dlg.ShowDialog($mainForm) -eq [System.Windows.Forms.DialogResult]::OK) {
-        try {
-            $mainForm.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-            New-HtmlReport -Rows $rows -Path $dlg.FileName -Start $script:CollectStart -End $script:CollectEnd -Computers $script:Computers -RunLog $script:RunLog
-            Update-StatusBar "HTML report saved to $($dlg.FileName)"
-            Invoke-Item $dlg.FileName
-        } catch { Show-Error 'HTML report' "Error creating report: $($_.Exception.Message)" }
-        finally { $mainForm.Cursor = [System.Windows.Forms.Cursors]::Default }
+        if (Write-HtmlReportAndOpen $dlg.FileName) { Update-StatusBar "HTML report saved to $($dlg.FileName)" }
     }
 }
 
@@ -2092,7 +2107,7 @@ SHARE
   File > Open session (Ctrl+O), drag and drop, or -SessionPath opens it on any machine, no server access needed.
   File > Add session merges more files (e.g. one per cluster node).
   Collect on a server without the GUI:  .\WinEventLogInvestigator.ps1 -NoGui -OutputPath C:\Temp\RCA
-  Also: CSV (Ctrl+E), Excel, and a self-contained interactive HTML report (Ctrl+H).
+  Also: CSV (Ctrl+E), Excel, and a self-contained interactive HTML report - view it in your browser (Ctrl+R) or save a copy (Ctrl+H).
 "@
     [void][System.Windows.Forms.MessageBox]::Show($mainForm, $tips, 'How to use', 'OK', 'Information')
 }
@@ -2105,6 +2120,9 @@ $miCsv.Add_Click({ Save-DisplayedCsv })
 $miExport.Add_Click({ Save-DisplayedCsv })
 $miExcel.Add_Click({ Open-DisplayedInExcel })
 $miHtml.Add_Click({ Save-HtmlReport })
+$miViewHtml.Add_Click({ Show-HtmlReport })
+$btnViewHtml.Add_Click({ Show-HtmlReport })
+$btnExcel.Add_Click({ Open-DisplayedInExcel })
 $miExit.Add_Click({ $mainForm.Close() })
 $miCollect.Add_Click({ Start-Collection })
 $miFind.Add_Click({ $txtSearch.Focus(); $txtSearch.SelectAll() })
