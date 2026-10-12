@@ -1,318 +1,1811 @@
+<#
+.SYNOPSIS
+    Windows Event Log Investigator - collect, filter and visualise problem events for RCA.
+
+.DESCRIPTION
+    Collects Critical / Error / Warning events plus curated "key" informational events
+    (reboots, SQL restarts, failovers, AG role changes, patching...) from one or more servers:
+
+      * System and Application logs
+      * SQL Server - every SQL provider registered in the Application log, plus the
+        SQL Server ERRORLOG files and SQL Agent logs (SQLAGENT.OUT) for every instance
+      * Failover Clustering - System log, FailoverClustering/Operational, Manager/Admin,
+        CsvFs/Operational and Cluster-Aware Updating
+      * Optional: Hyper-V, Security (failed logons, lockouts, log cleared), SCOM
+
+    Events are categorised (SQL Server, Cluster, Storage, Network/AD, Power/Boot...),
+    tagged with a plain-English description of well-known event IDs, and shown on an
+    interactive timeline: stacked problem counts per time bucket, swim lanes per category
+    (or computer / provider) and vertical marker lines for reboots, SQL restarts and
+    failovers. Drag on the timeline to zoom, click a bar or dot to drill in, right-click
+    to zoom out. Results export to CSV or a self-contained interactive HTML report.
+
+    Run without parameters for the GUI, or with -NoGui for headless collection.
+
+.PARAMETER ComputerName
+    One or more computers to collect from (default: local computer). Remote collection
+    uses the Remote Event Log Management firewall rules; SQL logs use Remote Registry
+    and the admin shares (\\server\D$).
+
+.PARAMETER StartTime
+    Start of the time window. Defaults to EndTime minus -Hours.
+
+.PARAMETER EndTime
+    End of the time window. Defaults to now.
+
+.PARAMETER Hours
+    Size of the time window in hours when -StartTime is not given (default 24).
+
+.PARAMETER Sources
+    What to collect: System, Application, SQL, SQLLogs, Cluster, HyperV, Security, OpsMgr.
+
+.PARAMETER IncludeInformation
+    Also collect all Information-level events (noisy). Key informational events
+    (reboots, failovers, SQL start/stop...) are always collected.
+
+.PARAMETER MaxEventsPerQuery
+    Safety cap per individual log query (default 5000).
+
+.PARAMETER NoGui
+    Collect without the GUI. Writes CSV + HTML to -OutputPath, or returns objects.
+
+.PARAMETER OutputPath
+    Folder for -NoGui output (CSV + HTML report).
+
+.PARAMETER AutoRun
+    GUI: start collecting as soon as the window opens.
+
+.EXAMPLE
+    .\WinEventLogInvestigator.ps1
+
+.EXAMPLE
+    .\WinEventLogInvestigator.ps1 -ComputerName SQLNODE1,SQLNODE2 -StartTime '2026-10-11 22:00' -EndTime '2026-10-12 02:00' -AutoRun
+
+.EXAMPLE
+    .\WinEventLogInvestigator.ps1 -ComputerName SQLNODE1 -Hours 72 -Sources System,SQL,SQLLogs,Cluster -NoGui -OutputPath C:\Temp\RCA
+#>
 #Requires -Version 5.1
-#Requires -RunAsAdministrator
-
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-
-# --- GUI Theme Configuration ---
-$theme = @{
-    FormBackground      = [System.Drawing.Color]::FromArgb(45, 45, 48)
-    ControlBackground   = [System.Drawing.Color]::FromArgb(60, 60, 63)
-    ControlForeground   = [System.Drawing.Color]::FromArgb(220, 220, 220)
-    ButtonBackground    = [System.Drawing.Color]::FromArgb(80, 80, 85)
-    ButtonForeground    = [System.Drawing.Color]::FromArgb(240, 240, 240)
-    GridBackground      = [System.Drawing.Color]::FromArgb(50, 50, 53)
-    GridForeground      = [System.Drawing.Color]::FromArgb(210, 210, 210)
-    GridHeaderBackground= [System.Drawing.Color]::FromArgb(70, 70, 73)
-    GridHeaderForeground= [System.Drawing.Color]::White
-    GridCellBackground  = [System.Drawing.Color]::FromArgb(60, 60, 63)
-    GridAltCellBackground= [System.Drawing.Color]::FromArgb(65, 65, 68)
-    GridSelectionBackground = [System.Drawing.Color]::FromArgb(0, 122, 204)
-    GridSelectionForeground = [System.Drawing.Color]::White
-    AccentColor         = [System.Drawing.Color]::FromArgb(0, 122, 204)
-}
-
-# --- Global Variables ---
-$script:AllEventsData = @()
-$script:FilteredEventsData = @()
-$script:EventLogJob = $null
-
-# --- Event Log Definitions ---
-$timeFrames = @(
-    [PSCustomObject]@{Name="Last 1 hour";Hours=-1},
-    [PSCustomObject]@{Name="Last 6 hours";Hours=-6},
-    [PSCustomObject]@{Name="Last 12 hours";Hours=-12},
-    [PSCustomObject]@{Name="Last 24 hours";Hours=-24},
-    [PSCustomObject]@{Name="Last 48 hours";Hours=-48},
-    [PSCustomObject]@{Name="Last 3 days (72 hours)";Hours=-72},
-    [PSCustomObject]@{Name="Last 1 week";Hours=-168}
+[CmdletBinding()]
+param(
+    [string[]]$ComputerName = @($env:COMPUTERNAME),
+    [datetime]$StartTime,
+    [datetime]$EndTime,
+    [ValidateRange(1, 8760)][int]$Hours = 24,
+    [string[]]$Sources = @('System', 'Application', 'SQL', 'SQLLogs', 'Cluster'),
+    [switch]$IncludeInformation,
+    [ValidateRange(100, 1000000)][int]$MaxEventsPerQuery = 5000,
+    [switch]$NoGui,
+    [string]$OutputPath,
+    [switch]$AutoRun
 )
 
-# --- GUI Element Creation ---
+# Accept comma separated lists too (powershell.exe -File passes 'a,b' as a single string)
+$ComputerName = @($ComputerName | ForEach-Object { $_ -split '[,;\s]+' } | Where-Object { $_ } | Select-Object -Unique)
+$validSources = 'System', 'Application', 'SQL', 'SQLLogs', 'Cluster', 'HyperV', 'Security', 'OpsMgr'
+$Sources = @($Sources | ForEach-Object { $_ -split '[,;\s]+' } | Where-Object { $_ } | ForEach-Object {
+    $src = $_; $match = $validSources | Where-Object { $_ -eq $src }
+    if (-not $match) { throw "Unknown source '$src'. Valid sources: $($validSources -join ', ')" }
+    $match } | Select-Object -Unique)
+if (-not $PSBoundParameters.ContainsKey('EndTime')) { $EndTime = Get-Date }
+if (-not $PSBoundParameters.ContainsKey('StartTime')) { $StartTime = $EndTime.AddHours(-$Hours) }
+if ($StartTime -ge $EndTime) { throw "StartTime ($StartTime) must be before EndTime ($EndTime)." }
+
+# The GUI needs .NET Framework (WinForms charting); relaunch in Windows PowerShell when started from PowerShell 7.
+if (-not $NoGui -and $PSVersionTable.PSEdition -eq 'Core') {
+    $winPs = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path $winPs)) { throw 'The GUI requires Windows PowerShell 5.1. Use -NoGui from PowerShell 7.' }
+    Write-Host 'Relaunching in Windows PowerShell 5.1 (the GUI charting requires .NET Framework)...'
+    $relaunch = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', $PSCommandPath,
+        '-ComputerName', ($ComputerName -join ','), '-StartTime', $StartTime.ToString('o'), '-EndTime', $EndTime.ToString('o'),
+        '-MaxEventsPerQuery', $MaxEventsPerQuery, '-Sources', ($Sources -join ','))
+    if ($IncludeInformation) { $relaunch += '-IncludeInformation' }
+    if ($AutoRun) { $relaunch += '-AutoRun' }
+    & $winPs @relaunch
+    return
+}
+
+#region ===================== Collector (runs locally or inside a background job) =====================
+$Collector = {
+    param([string]$Computer, [datetime]$Start, [datetime]$End, [string[]]$Sources, [int]$MaxEvents, [bool]$IncludeInfo)
+
+    $isLocal = [string]::IsNullOrWhiteSpace($Computer) -or $Computer -in @('.', 'localhost', '127.0.0.1') -or
+               $Computer -ieq $env:COMPUTERNAME -or $Computer -ieq "$env:COMPUTERNAME.$env:USERDNSDOMAIN"
+    $machine  = if ($isLocal) { $env:COMPUTERNAME } else { $Computer.ToUpper() }
+    $results  = New-Object System.Collections.Generic.List[object]
+    $runLog   = New-Object System.Collections.Generic.List[string]
+    $seen     = @{}
+    $startUtc = $Start.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $endUtc   = $End.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $levelNames = @{ 1 = 'Critical'; 2 = 'Error'; 3 = 'Warning'; 4 = 'Information' }
+    $problemLevels = if ($IncludeInfo) { @(1, 2, 3, 4, 0) } else { @(1, 2, 3) }
+    $sqlProviderRx = '^(MSSQL|SQLAgent|SQLSERVERAGENT|SQLWriter|SQLBrowser|SQLIS|SQLTELEMETRY|SQLCEIP|SSISTELEMETRY|SQLDumper|SQLVDI|SQLBackupToUrl|MSOLAP|ReportServer|SQL Server)'
+    # Service Control Manager 7036/7040 are only kept for services that matter for SQL/cluster RCA
+    $serviceInterestRx = '(?i)SQL|Cluster|MSDTC|Distributed Transaction|Analysis Services|Reporting Services|Integration Services|Power BI|Windows Update|Windows Modules Installer|Hyper-V|Volume Shadow|Netlogon|Windows Time'
+
+    function Write-RunLog([string]$Text) { $runLog.Add(('{0:HH:mm:ss} [{1}] {2}' -f (Get-Date), $machine, $Text)) }
+    function Write-Step([string]$Text) { Write-Progress -Activity "Collecting from $machine" -Status $Text }
+
+    #---- Categories --------------------------------------------------------------------------
+    $categoryCache = @{}
+    function Get-EventCategory([string]$LogName, [string]$Provider) {
+        $key = "$LogName|$Provider"
+        if ($categoryCache.ContainsKey($key)) { return $categoryCache[$key] }
+        $cat = $null
+        if ($LogName -eq 'Security') { $cat = 'Security' }
+        elseif ($LogName -eq 'Operations Manager') { $cat = 'OpsMgr' }
+        else {
+            $cat = switch -Regex ($Provider) {
+                $sqlProviderRx { 'SQL Server'; break }
+                'FailoverClustering|ClusSvc|ClusterAwareUpdating' { 'Cluster'; break }
+                'Hyper-V' { 'Hyper-V'; break }
+                '^(Microsoft-Windows-Kernel-Power|Microsoft-Windows-Kernel-General|EventLog|User32|Microsoft-Windows-Kernel-Boot|Microsoft-Windows-WER-SystemErrorReporting|BugCheck|Microsoft-Windows-Power-Troubleshooter|Microsoft-Windows-Winlogon|Microsoft-Windows-Wininit)$' { 'Power / Boot'; break }
+                '^(disk|Ntfs|Microsoft-Windows-Ntfs|storvsc|storahci|stornvme|StorPort|Microsoft-Windows-StorPort|volmgr|volsnap|mpio|msdsm|iScsiPrt|Microsoft-Windows-Disk|Microsoft-Windows-StorageSpaces.*|Microsoft-Windows-ReFS|ReFS|VSS|Microsoft-Windows-Storage.*|partmgr|Microsoft-Windows-Partition|LSI_.*|megasas.*|percsas.*|HpCISSs.*|smartpqi|ql2.*|elx.*|Microsoft-Windows-Kernel-IO|Microsoft-Windows-Volume.*)$' { 'Storage'; break }
+                '^(Tcpip|Microsoft-Windows-Tcpip|NetBT|NETLOGON|Microsoft-Windows-DNS-Client|DnsApi|Microsoft-Windows-Time-Service|W32Time|Microsoft-Windows-NDIS|Microsoft-Windows-MsLbfoProvider|Microsoft-Windows-NetworkProfile|e1.express|ixgbe|i40e.*|bxnd.*|b57nd.*|ebdrv|mlx.*|vmxnet.*|netvsc|Microsoft-Windows-SMBClient|Microsoft-Windows-SMBServer|Srv|LsaSrv|Microsoft-Windows-Security-Kerberos|Kerberos|Microsoft-Windows-GroupPolicy|Userenv|Schannel|Microsoft-Windows-Iphlpsvc|Dhcp.*|Microsoft-Windows-Dhcp.*)$' { 'Network / AD / Auth'; break }
+                '^Service Control Manager$' { 'Services'; break }
+                '^(Microsoft-Windows-WindowsUpdateClient|Microsoft-Windows-Servicing|MsiInstaller|TrustedInstaller|Microsoft-Windows-RestartManager|Windows Server Update Services)$' { 'Updates / Installs'; break }
+                '^(Application Error|Application Hang|Windows Error Reporting|\.NET Runtime|Microsoft-Windows-WER.*)$' { 'App Crashes'; break }
+                '^(Microsoft-Windows-Resource-Exhaustion-Detector|Microsoft-Windows-Resource-Exhaustion-Resolver|Microsoft-Windows-MemoryDiagnostics.*|PerfNet|Perflib|Microsoft-Windows-Perflib|LoadPerf|WMI|Microsoft-Windows-WMI)$' { 'Resources / Perf'; break }
+                '^(HealthService|Health Service.*|OpsMgr.*)' { 'OpsMgr'; break }
+            }
+            if (-not $cat) {
+                if ($LogName -match 'FailoverClustering|ClusterAwareUpdating') { $cat = 'Cluster' }
+                elseif ($LogName -match 'Hyper-V') { $cat = 'Hyper-V' }
+                elseif ($LogName -eq 'System') { $cat = 'System (other)' }
+                elseif ($LogName -eq 'Application') { $cat = 'Application (other)' }
+                else { $cat = $LogName }
+            }
+        }
+        $categoryCache[$key] = $cat
+        return $cat
+    }
+
+    #---- Well-known event rules: tag text, timeline marker kind, minimum severity ------------
+    $rules = @{}
+    function Add-Rule([string]$Category, [string]$ProviderRx, [int[]]$Ids, [string]$Tag, [string]$Marker = '', [int]$Level = 0) {
+        foreach ($i in $Ids) {
+            $k = "$Category|$i"
+            if (-not $rules.ContainsKey($k)) { $rules[$k] = New-Object System.Collections.Generic.List[object] }
+            $rules[$k].Add(@{ Rx = $ProviderRx; Tag = $Tag; Marker = $Marker; Level = $Level })
+        }
+    }
+    function Resolve-Rule([string]$Category, [int]$Id, [string]$Provider) {
+        $list = $rules["$Category|$Id"]
+        if ($list) { foreach ($r in $list) { if ($Provider -match $r.Rx) { return $r } } }
+        return $null
+    }
+
+    $pb = 'Power / Boot'
+    Add-Rule $pb '^EventLog$' 6005 'Boot (Event Log service started)' 'Boot'
+    Add-Rule $pb '^EventLog$' 6006 'Clean shutdown (Event Log stopped)'
+    Add-Rule $pb '^EventLog$' 6008 'Unexpected shutdown' 'Crash' 2
+    Add-Rule $pb '^EventLog$' 6009 'OS version at boot'
+    Add-Rule $pb 'Kernel-Power' 41 'Unexpected reboot (Kernel-Power 41)' 'Crash' 1
+    Add-Rule $pb 'Kernel-Power' 109 'Kernel shutdown initiated'
+    Add-Rule $pb '^User32$' 1074 'Planned restart / shutdown' 'Shutdown'
+    Add-Rule $pb '^User32$' 1076 'Shutdown reason recorded'
+    Add-Rule $pb 'Kernel-General' 12 'OS started'
+    Add-Rule $pb 'Kernel-General' 13 'OS shutting down'
+    Add-Rule $pb 'WER-SystemErrorReporting|BugCheck' 1001 'Bugcheck (BSOD)' 'Crash' 1
+
+    $sv = 'Services'; $scm = '^Service Control Manager$'
+    Add-Rule $sv $scm 7000 'Service failed to start'
+    Add-Rule $sv $scm 7001 'Dependent service failed to start'
+    Add-Rule $sv $scm 7009 'Service start timeout'
+    Add-Rule $sv $scm 7011 'Service response timeout'
+    Add-Rule $sv $scm 7022 'Service hung on start'
+    Add-Rule $sv $scm @(7023, 7024) 'Service terminated with error'
+    Add-Rule $sv $scm 7031 'Service crashed (will restart)' '' 2
+    Add-Rule $sv $scm 7034 'Service crashed' '' 2
+    Add-Rule $sv $scm 7036 'Service state change'
+    Add-Rule $sv $scm 7040 'Service start type changed'
+    Add-Rule $sv $scm 7045 'New service installed'
+
+    $up = 'Updates / Installs'
+    Add-Rule $up 'WindowsUpdateClient' 19 'Windows Update installed' 'Update'
+    Add-Rule $up 'WindowsUpdateClient' 20 'Windows Update failed' '' 2
+    Add-Rule $up 'WindowsUpdateClient' 43 'Windows Update install started'
+    Add-Rule $up '^MsiInstaller$' @(1033, 11707) 'Product installed'
+    Add-Rule $up '^MsiInstaller$' @(1034, 11724) 'Product removed'
+    Add-Rule $up '^MsiInstaller$' 11708 'Product install failed'
+
+    $ac = 'App Crashes'
+    Add-Rule $ac '^Application Error$' 1000 'Application crash'
+    Add-Rule $ac '^Application Hang$' 1002 'Application hang'
+    Add-Rule $ac 'Windows Error Reporting' 1001 'WER fault report'
+    Add-Rule $ac '\.NET Runtime' 1026 '.NET unhandled exception'
+
+    $st = 'Storage'
+    Add-Rule $st '^disk$' 7 'Bad block on disk' '' 2
+    Add-Rule $st '^disk$' 11 'Disk controller error' '' 2
+    Add-Rule $st '^disk$' 15 'Disk not ready'
+    Add-Rule $st '^disk$' 51 'Paging I/O error'
+    Add-Rule $st '^disk$' 52 'Disk failure predicted' '' 1
+    Add-Rule $st '^disk$' 153 'Disk I/O retried'
+    Add-Rule $st '.' 129 'Storage reset (I/O timeout)'
+    Add-Rule $st 'Ntfs' 55 'File system corruption' '' 2
+    Add-Rule $st 'Ntfs' 137 'NTFS transaction error'
+    Add-Rule $st 'Ntfs' 140 'Failed to flush data (delayed write)' '' 2
+    Add-Rule $st '.' @(50, 57) 'Delayed write failed' '' 2
+    Add-Rule $st 'volsnap' @(25, 33, 36) 'Shadow copies deleted'
+    Add-Rule $st 'mpio|msdsm' @(16, 17, 20, 32, 46) 'MPIO path event'
+    Add-Rule $st 'iScsiPrt' @(1, 7, 20, 39, 129) 'iSCSI connection problem'
+
+    $na = 'Network / AD / Auth'
+    Add-Rule $na 'NETLOGON' 5719 'No domain controller available'
+    Add-Rule $na 'NETLOGON' 5805 'Session setup failed'
+    Add-Rule $na 'Time-Service|W32Time' @(36, 129, 134, 142) 'Time synchronisation problem'
+    Add-Rule $na 'Tcpip' 4227 'TCP/IP port exhaustion' '' 2
+    Add-Rule $na 'Tcpip' 4199 'IP address conflict' '' 2
+    Add-Rule $na 'DNS-Client' 1014 'DNS name resolution timeout'
+    Add-Rule $na 'Schannel' @(36870, 36871, 36874, 36887, 36888) 'TLS / Schannel error'
+    Add-Rule $na 'LsaSrv' @(40960, 40961) 'Authentication failure (LSA)'
+    Add-Rule $na 'Kerberos' 4 'Kerberos ticket problem (duplicate SPN?)'
+
+    $rs = 'Resources / Perf'
+    Add-Rule $rs 'Resource-Exhaustion-Detector' 2004 'Low virtual memory' '' 2
+    Add-Rule $rs '^Srv$' @(2019, 2020) 'Kernel pool exhausted' '' 2
+
+    $cl = 'Cluster'; $fc = 'FailoverClustering'
+    Add-Rule $cl $fc 1069 'Cluster resource failed'
+    Add-Rule $cl $fc 1135 'Node removed from cluster membership' 'Cluster' 1
+    Add-Rule $cl $fc 1177 'Cluster quorum lost' 'Cluster' 1
+    Add-Rule $cl $fc 1146 'Resource host (RHS) crashed'
+    Add-Rule $cl $fc 1205 'Cluster role failed to come online'
+    Add-Rule $cl $fc 1254 'Role exceeded failover threshold'
+    Add-Rule $cl $fc 1230 'Resource call timed out (deadlock)'
+    Add-Rule $cl $fc @(1126, 1127, 1129, 1130) 'Cluster network problem'
+    Add-Rule $cl $fc 1196 'Cluster DNS registration failed'
+    Add-Rule $cl $fc @(1557, 1558) 'Quorum disk / witness problem'
+    Add-Rule $cl $fc 1561 'Cluster could not start - no quorum' 'Cluster' 1
+    Add-Rule $cl $fc 1564 'File share witness unreachable'
+    Add-Rule $cl $fc 1573 'Node could not form cluster (no quorum)'
+    Add-Rule $cl $fc 5120 'CSV paused / no longer available' 'Cluster'
+    Add-Rule $cl $fc 5121 'CSV in redirected access'
+    Add-Rule $cl $fc 5142 'CSV no longer accessible'
+    Add-Rule $cl $fc 1641 'Cluster role moved' 'Cluster'
+    Add-Rule $cl $fc 1153 'Failover attempted' 'Cluster'
+    Add-Rule $cl $fc 1201 'Cluster role online'
+    Add-Rule $cl $fc 1204 'Cluster role offline'
+    Add-Rule $cl $fc 1200 'Bringing cluster role online'
+    Add-Rule $cl $fc 1203 'Taking cluster role offline'
+
+    $sq = 'SQL Server'; $ms = '^(MSSQL|SQL Server)'
+    Add-Rule $sq $ms 17126 'SQL Server ready for connections' 'SQL'
+    Add-Rule $sq $ms 17147 'SQL Server stopping (system shutdown)' 'SQL'
+    Add-Rule $sq $ms 17148 'SQL Server stopping (service control)' 'SQL'
+    Add-Rule $sq $ms 17137 'Starting up database'
+    Add-Rule $sq $ms 18456 'Login failed' '' 3
+    Add-Rule $sq $ms 18452 'Login failed (untrusted domain)' '' 3
+    Add-Rule $sq $ms @(17806, 17836) 'Login handshake / SSPI failure' '' 3
+    Add-Rule $sq $ms 17809 'Max user connections reached' '' 2
+    Add-Rule $sq $ms 833 'Slow I/O (> 15 seconds)' '' 3
+    Add-Rule $sq $ms 823 'OS I/O error' '' 1
+    Add-Rule $sq $ms 824 'Logical consistency I/O error (corruption)' '' 1
+    Add-Rule $sq $ms 825 'Read retry required' '' 2
+    Add-Rule $sq $ms 9002 'Transaction log full' '' 2
+    Add-Rule $sq $ms 9001 'Transaction log not available' '' 2
+    Add-Rule $sq $ms 1105 'Filegroup full' '' 2
+    Add-Rule $sq $ms 701 'Insufficient system memory' '' 2
+    Add-Rule $sq $ms 17883 'Non-yielding worker' '' 2
+    Add-Rule $sq $ms @(17884, 17888) 'Deadlocked schedulers' '' 1
+    Add-Rule $sq $ms 17890 'SQL memory paged out' '' 3
+    Add-Rule $sq $ms 17053 'Operating system error' '' 2
+    Add-Rule $sq $ms 3449 'SQL shutting down to recover' '' 1
+    Add-Rule $sq $ms 3041 'Backup failed' '' 2
+    Add-Rule $sq $ms 18210 'Backup device failure' '' 2
+    Add-Rule $sq $ms @(5144, 5145) 'File autogrow cancelled / slow' '' 3
+    Add-Rule $sq $ms 1205 'Deadlock' '' 3
+    Add-Rule $sq $ms 1480 'AG database changing role' 'AG'
+    Add-Rule $sq $ms 19406 'AG replica state changed' 'AG'
+    Add-Rule $sq $ms 19407 'AG lease expired' 'AG' 2
+    Add-Rule $sq $ms 35264 'AG data movement suspended' '' 3
+    Add-Rule $sq $ms 35265 'AG data movement resumed'
+    Add-Rule $sq '^(SQLAgent|SQLSERVERAGENT)' 208 'SQL Agent job failed' '' 2
+
+    $se = 'Security'; $sa = 'Security-Auditing|Eventlog'
+    Add-Rule $se $sa 1102 'Security audit log cleared' 'Security' 2
+    Add-Rule $se $sa 4625 'Failed logon' '' 3
+    Add-Rule $se $sa 4740 'Account locked out' '' 3
+    Add-Rule $se $sa 4771 'Kerberos pre-authentication failed' '' 3
+    Add-Rule $se $sa 4719 'Audit policy changed' '' 3
+
+    # Informational events worth collecting regardless of level - scoped to their provider, as IDs are reused by other providers
+    $systemKeyEvents = [ordered]@{
+        'EventLog' = @(6005, 6006, 6008, 6009)
+        'Microsoft-Windows-Kernel-Power' = @(41, 109)
+        'User32' = @(1074, 1076)
+        'Microsoft-Windows-Kernel-General' = @(12, 13)
+        'Microsoft-Windows-WER-SystemErrorReporting|BugCheck' = @(1001)
+        'Service Control Manager' = @(7036, 7040, 7045)
+        'Microsoft-Windows-WindowsUpdateClient' = @(19, 43)
+    }
+    $appKeyEvents = [ordered]@{
+        'MsiInstaller' = @(1033, 1034, 11707, 11724)
+        'Windows Error Reporting' = @(1001)
+    }
+    $sqlKeyIds     = @(17126, 17147, 17148, 17137, 18456, 18452, 17806, 17836, 17809, 833, 823, 824, 825, 9002, 9001, 1105, 701,
+                       17883, 17884, 17888, 17890, 17053, 3449, 3041, 18210, 5144, 5145, 1205, 1480, 19406, 19407, 35264, 35265, 208)
+    $clusterKeyIds = @(1069, 1135, 1146, 1153, 1177, 1200, 1201, 1202, 1203, 1204, 1205, 1230, 1254, 1557, 1558, 1561, 1573,
+                       1626, 1641, 1650, 1726, 1794, 5120, 5121, 5142)
+    $securityIds   = @(1102, 4625, 4740, 4771, 4719)
+    $opsMgrIds     = @(1102, 1103, 4502, 4506, 20000, 20020, 20022, 21016, 21034, 26004)
+
+    #---- Event record conversion -------------------------------------------------------------
+    function Add-EventRecords($Events) {
+        $added = 0
+        foreach ($e in $Events) {
+            if ($null -eq $e) { continue }
+            $k = "$($e.LogName)|$($e.RecordId)"
+            if ($seen.ContainsKey($k)) { continue }
+            $seen[$k] = $true
+            $msg = $null
+            try { $msg = $e.Message } catch { }
+            if ([string]::IsNullOrWhiteSpace($msg)) {
+                $msg = '(Message text unavailable - provider not registered on the collecting machine) ' + (($e.Properties | ForEach-Object { $_.Value }) -join ' | ')
+            }
+            if ($e.ProviderName -eq 'Service Control Manager' -and ($e.Id -eq 7036 -or $e.Id -eq 7040) -and $msg -notmatch $serviceInterestRx) { continue }
+            $msg = $msg.Trim()
+            if ($msg.Length -gt 8000) { $msg = $msg.Substring(0, 8000) + ' ...[truncated]' }
+
+            $lvl = [int]$e.Level
+            if ($lvl -lt 1 -or $lvl -gt 4) { $lvl = 4 }
+            $lvlName = $levelNames[$lvl]
+            if ($e.LogName -eq 'Security' -and $null -ne $e.Keywords -and (([long]$e.Keywords -band 0x10000000000000L) -ne 0)) { $lvl = 3; $lvlName = 'Audit Failure' }
+
+            $cat = Get-EventCategory $e.LogName $e.ProviderName
+            $tag = ''; $marker = ''
+            $rule = Resolve-Rule $cat $e.Id $e.ProviderName
+            if ($rule) {
+                $tag = $rule.Tag; $marker = $rule.Marker
+                if ($rule.Level -gt 0 -and $lvl -gt $rule.Level) { $lvl = $rule.Level; $lvlName = $levelNames[$lvl] }
+            }
+            $results.Add([pscustomobject]@{
+                Time = $e.TimeCreated; Computer = $machine; Level = $lvlName; LevelNum = $lvl; Category = $cat
+                Tag = $tag; Marker = $marker; Id = [int]$e.Id; Provider = [string]$e.ProviderName; LogName = [string]$e.LogName
+                RecordId = [long]$e.RecordId; Source = 'Event Log'; Message = $msg
+            })
+            $added++
+        }
+        return $added
+    }
+
+    function Get-LogInfo([string]$LogName) {
+        $p = @{ ListLog = $LogName; ErrorAction = 'Stop' }
+        if (-not $isLocal) { $p.ComputerName = $Computer }
+        try { return Get-WinEvent @p } catch { return $null }
+    }
+
+    function Split-Chunks($Items, [int]$Size) {
+        $chunks = New-Object System.Collections.Generic.List[object]
+        $arr = @($Items)
+        for ($i = 0; $i -lt $arr.Count; $i += $Size) { $chunks.Add(@($arr[$i..([math]::Min($i + $Size, $arr.Count) - 1)])) }
+        return , $chunks
+    }
+
+    # Runs XPath queries against one log. Levels and IDs are OR'ed; providers (if any) restrict both.
+    function Invoke-LogQuery {
+        param([string]$LogName, [string]$Label, [int[]]$Levels, [int[]]$Ids, [string[]]$Providers, $KeyEvents)
+        if (-not $Label) { $Label = $LogName }
+        Write-Step $Label
+        $info = Get-LogInfo $LogName
+        if (-not $info) { Write-RunLog "$Label : log not present - skipped"; return $false }
+        if (-not $info.IsEnabled) { Write-RunLog "$Label : log is disabled - skipped"; return $true }
+
+        $selectors = New-Object System.Collections.Generic.List[string]
+        if ($Levels) { $selectors.Add('(' + (($Levels | ForEach-Object { "Level=$_" }) -join ' or ') + ')') }
+        if ($Ids) { foreach ($c in (Split-Chunks $Ids 15)) { $selectors.Add('(' + (($c | ForEach-Object { "EventID=$_" }) -join ' or ') + ')') } }
+        if ($KeyEvents) {
+            # key = provider name(s) separated by '|', value = event IDs
+            foreach ($k in $KeyEvents.Keys) {
+                $names = ($k -split '\|') | ForEach-Object { "@Name='$_'" }
+                $selectors.Add('(Provider[' + ($names -join ' or ') + '] and (' + (($KeyEvents[$k] | ForEach-Object { "EventID=$_" }) -join ' or ') + '))')
+            }
+        }
+        $providerClauses = New-Object System.Collections.Generic.List[string]
+        if ($Providers) {
+            foreach ($c in (Split-Chunks $Providers 10)) {
+                $names = $c | ForEach-Object { if ($_ -match "'") { "@Name=`"$_`"" } else { "@Name='$_'" } }
+                $providerClauses.Add('Provider[' + ($names -join ' or ') + ']')
+            }
+        } else { $providerClauses.Add('') }
+
+        $total = 0; $capped = $false
+        foreach ($pc in $providerClauses) {
+            foreach ($sel in $selectors) {
+                $conds = @("TimeCreated[@SystemTime>='$startUtc' and @SystemTime<='$endUtc']", $sel)
+                if ($pc) { $conds += $pc }
+                $q = @{ LogName = $LogName; FilterXPath = ('*[System[' + ($conds -join ' and ') + ']]'); MaxEvents = $MaxEvents; ErrorAction = 'Stop' }
+                if (-not $isLocal) { $q.ComputerName = $Computer }
+                $found = @()
+                try { $found = @(Get-WinEvent @q) }
+                catch {
+                    if ($_.FullyQualifiedErrorId -notmatch 'NoMatchingEventsFound') { Write-RunLog "$Label : query failed - $($_.Exception.Message)" }
+                }
+                if ($found.Count -ge $MaxEvents) { $capped = $true }
+                $total += Add-EventRecords $found
+            }
+        }
+        $note = if ($capped) { " (WARNING: hit MaxEventsPerQuery=$MaxEvents - older events in the window may be missing)" } else { '' }
+        Write-RunLog "$Label : $total events$note"
+        return $true
+    }
+
+    #---- SQL Server ERRORLOG / SQL Agent log files -------------------------------------------
+    function ConvertTo-AccessPath([string]$Path) {
+        if (-not $Path) { return $null }
+        if ($isLocal -or $Path.StartsWith('\\')) { return $Path }
+        if ($Path -match '^([A-Za-z]):\\(.*)$') { return "\\$Computer\$($Matches[1])`$\$($Matches[2])" }
+        return $Path
+    }
+
+    function Get-SqlLogLocations {
+        $found = New-Object System.Collections.Generic.List[object]
+        try {
+            if ($isLocal) { $hive = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64) }
+            else { $hive = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $Computer, [Microsoft.Win32.RegistryView]::Registry64) }
+        } catch { Write-RunLog "SQL log files: cannot open registry ($($_.Exception.Message)) - is the Remote Registry service running?"; return , $found }
+        $root = 'SOFTWARE\Microsoft\Microsoft SQL Server'
+        $openKey = { param($Path) try { $hive.OpenSubKey($Path) } catch { $null } }
+        $names = & $openKey "$root\Instance Names\SQL"
+        if (-not $names) { Write-RunLog 'SQL log files: no SQL Server instances registered'; $hive.Close(); return , $found }
+        foreach ($inst in $names.GetValueNames()) {
+            $id = [string]$names.GetValue($inst)
+            $errDir = $null; $agentFile = $null
+            $params = & $openKey "$root\$id\MSSQLServer\Parameters"
+            if ($params) { foreach ($v in $params.GetValueNames()) { $val = [string]$params.GetValue($v); if ($val -like '-e*') { $errDir = Split-Path $val.Substring(2) } } }
+            if (-not $errDir) {
+                # Parameters key is often admin-only; fall back to the default <instance root>\Log folder
+                $setup = & $openKey "$root\$id\Setup"
+                if ($setup -and $setup.GetValue('SQLDataRoot')) { $errDir = Join-Path ([string]$setup.GetValue('SQLDataRoot')) 'Log' }
+                if (-not $params) { Write-RunLog "SQL log files ($inst): startup parameters not readable (run as Administrator?) - assuming $errDir" }
+            }
+            $agent = & $openKey "$root\$id\SQLServerAgent"
+            if ($agent) { $agentFile = [string]$agent.GetValue('ErrorLogFile') }
+            if (-not $agentFile -and $errDir) { $agentFile = Join-Path $errDir 'SQLAGENT.OUT' }
+            $found.Add([pscustomobject]@{ Instance = $inst; ErrorLogDir = (ConvertTo-AccessPath $errDir); AgentLogDir = (ConvertTo-AccessPath $(if ($agentFile) { Split-Path $agentFile })) })
+        }
+        $hive.Close()
+        return , $found
+    }
+
+    function Read-LogLines([string]$Path) {
+        $lines = New-Object System.Collections.Generic.List[string]
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]'ReadWrite, Delete')
+        $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::Default, $true)
+        try { while ($null -ne ($line = $sr.ReadLine())) { $lines.Add($line) } } finally { $sr.Dispose() }
+        return , $lines
+    }
+
+    $startStr = $Start.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+    $endStr   = $End.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+    $sqlLogExcludeRx = '(?i)(found 0 errors|0 errors and 0|without errors|no user action is required|This is an informational message|error log has been reinitialized|Logging SQL Server messages in file|Registry startup parameters|Error: 0,|CHECKDB .* finished without|Recovery completed|Setting database option|Configuration option|Login succeeded|successfully|Error reporting|Server process ID|Authentication mode|SQL Server is now ready)'
+    $sqlLogSevereRx  = '(?i)(stack dump|Stack Signature|access violation|corrupt|non-yielding|deadlocked schedulers|severe error|assertion|latch timeout|exception .* address)'
+    $sqlLogProblemRx = '(?i)\b(error|errors|fail|failed|failure|timed? ?out|timeout|insufficient|terminat\w*|unable|cannot|could not|exception|paged out|unloaded|denied|lease|suspended|not synchroniz\w*|disconnected|taking longer than 15 seconds)\b'
+
+    function Import-SqlErrorLog([string]$Path, [string]$Instance, $EventLogKeys) {
+        $lines = Read-LogLines $Path
+        $entries = New-Object System.Collections.Generic.List[object]
+        $cur = $null
+        foreach ($line in $lines) {
+            if ($line.Length -ge 23 -and $line[4] -eq '-' -and $line[10] -eq ' ' -and $line[19] -eq '.') {
+                $ts19 = $line.Substring(0, 19)
+                if ([string]::CompareOrdinal($ts19, $startStr) -lt 0 -or [string]::CompareOrdinal($ts19, $endStr) -gt 0) { $cur = $null; continue }
+                if ($line -match '^(\S+ \S+)\s+(\S+)\s+(.*)$') {
+                    $cur = @{ Time = $Matches[1]; Spid = $Matches[2]; Text = $Matches[3] }
+                    $entries.Add($cur)
+                }
+            } elseif ($null -ne $cur -and $line.Trim()) { $cur.Text += "`n" + $line.TrimEnd() }
+        }
+        $provider = if ($Instance -eq 'MSSQLSERVER') { 'MSSQLSERVER' } else { "MSSQL`$$Instance" }
+        $added = 0; $dupes = 0; $i = 0
+        while ($i -lt $entries.Count) {
+            $en = $entries[$i]; $i++
+            $text = $en.Text; $errNum = 0; $sev = -1
+            if ($text -match '^Error: (\d+), Severity: (\d+), State: (\d+)') {
+                $errNum = [int]$Matches[1]; $sev = [int]$Matches[2]; $state = $Matches[3]
+                if ($i -lt $entries.Count -and $entries[$i].Spid -eq $en.Spid -and $entries[$i].Time.Substring(0, 19) -eq $en.Time.Substring(0, 19)) {
+                    $text = $entries[$i].Text + "  [Error $errNum, Severity $sev, State $state]"; $i++
+                }
+            }
+            $time = [datetime]::ParseExact($en.Time, 'yyyy-MM-dd HH:mm:ss.ff', [Globalization.CultureInfo]::InvariantCulture)
+            if ($errNum -gt 0 -and $EventLogKeys.ContainsKey("$errNum|$($time.ToString('yyyyMMddHHmmss'))")) { $dupes++; continue }
+
+            if ($sev -ge 0) { $lvl = if ($sev -ge 20) { 1 } elseif ($sev -ge 17) { 2 } elseif ($sev -ge 11) { 3 } else { 4 } }
+            elseif ($text -match $sqlLogExcludeRx) { $lvl = 4 }
+            elseif ($text -match $sqlLogSevereRx) { $lvl = 2 }
+            elseif ($text -match $sqlLogProblemRx) { $lvl = 3 }
+            else { $lvl = 4 }
+            if ($text -match '^(Stack Signature|\* \*{5,}|BEGIN STACK DUMP)') { $lvl = 1 }
+
+            $tag = ''; $marker = ''
+            if ($text -match '^SQL Server is starting at') { $tag = 'SQL Server starting'; $marker = 'SQL' }
+            elseif ($text -match 'SQL Server is now ready for client connections') { $tag = 'SQL Server ready for connections'; $marker = 'SQL' }
+            elseif ($text -match '^(SQL Server is terminating|SQL Server shutdown (has been initiated|due to)|Server shut down by)') { $tag = 'SQL Server stopping'; $marker = 'SQL'; $lvl = 4 }
+            elseif ($text -match "The state of the local availability replica in availability group '([^']+)' has changed from '([^']+)' to '([^']+)'") { $tag = "AG $($Matches[1]): $($Matches[2]) -> $($Matches[3])"; $marker = 'AG' }
+            elseif ($text -match 'is changing roles from') { $tag = 'AG database changing role'; $marker = 'AG' }
+            elseif ($text -match 'appears to be non-yielding') { $tag = 'Non-yielding scheduler'; if ($lvl -gt 2) { $lvl = 2 } }
+            elseif ($text -match 'I/O requests taking longer than 15 seconds') { $tag = 'Slow I/O (> 15 seconds)'; if ($lvl -gt 3) { $lvl = 3 } }
+            elseif ($text -match 'A significant part of sql server process memory has been paged out') { $tag = 'SQL memory paged out'; if ($lvl -gt 3) { $lvl = 3 } }
+            elseif ($errNum -gt 0) {
+                $rule = Resolve-Rule 'SQL Server' $errNum $provider
+                if ($rule) { $tag = $rule.Tag; $marker = $rule.Marker; if ($rule.Level -gt 0 -and $lvl -gt $rule.Level) { $lvl = $rule.Level } }
+            }
+            if ($lvl -eq 4 -and -not $marker -and -not $IncludeInfo) { continue }
+            if ($text.Length -gt 8000) { $text = $text.Substring(0, 8000) + ' ...[truncated]' }
+            $results.Add([pscustomobject]@{
+                Time = $time; Computer = $machine; Level = $levelNames[$lvl]; LevelNum = $lvl; Category = 'SQL ERRORLOG'
+                Tag = $tag; Marker = $marker; Id = $errNum; Provider = $provider; LogName = "ERRORLOG ($Instance) $(Split-Path $Path -Leaf)"
+                RecordId = [long]0; Source = 'SQL ERRORLOG'; Message = "[$($en.Spid)] $text"
+            })
+            $added++
+        }
+        return @($added, $dupes)
+    }
+
+    function Import-SqlAgentLog([string]$Path, [string]$Instance) {
+        $lines = Read-LogLines $Path
+        $provider = if ($Instance -eq 'MSSQLSERVER') { 'SQLSERVERAGENT' } else { "SQLAgent`$$Instance" }
+        $added = 0; $cur = $null
+        foreach ($line in $lines) {
+            if ($line -match '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) - (.) \[(\d+)\] (.*)$') {
+                $cur = $null
+                $ts = $Matches[1]
+                if ([string]::CompareOrdinal($ts, $startStr) -lt 0 -or [string]::CompareOrdinal($ts, $endStr) -gt 0) { continue }
+                $lvl = switch ($Matches[2]) { '!' { 2 } '?' { 3 } default { 4 } }
+                if ($lvl -eq 4 -and -not $IncludeInfo) { continue }
+                $cur = [pscustomobject]@{
+                    Time = [datetime]::ParseExact($ts, 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+                    Computer = $machine; Level = $levelNames[$lvl]; LevelNum = $lvl; Category = 'SQL Agent'; Tag = ''; Marker = ''
+                    Id = [int]$Matches[3]; Provider = $provider; LogName = "SQL Agent log ($Instance) $(Split-Path $Path -Leaf)"
+                    RecordId = [long]0; Source = 'SQL Agent log'; Message = $Matches[4]
+                }
+                $results.Add($cur); $added++
+            } elseif ($null -ne $cur -and $line.Trim()) { $cur.Message += "`n" + $line.TrimEnd() }
+        }
+        return $added
+    }
+
+    function Import-SqlLogFiles {
+        Write-Step 'SQL Server ERRORLOG / Agent log files'
+        # SQL writes most errors to both the Application log and ERRORLOG - skip ERRORLOG copies of events we already have
+        $eventLogKeys = @{}
+        foreach ($r in $results) {
+            if ($r.Category -eq 'SQL Server') { foreach ($d in -1, 0, 1) { $eventLogKeys["$($r.Id)|$($r.Time.AddSeconds($d).ToString('yyyyMMddHHmmss'))"] = $true } }
+        }
+        foreach ($loc in (Get-SqlLogLocations)) {
+            if ($loc.ErrorLogDir -and (Test-Path -LiteralPath $loc.ErrorLogDir)) {
+                $files = Get-ChildItem -LiteralPath $loc.ErrorLogDir -Filter 'ERRORLOG*' -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match '^ERRORLOG(\.\d+)?$' -and $_.LastWriteTime -ge $Start } | Sort-Object LastWriteTime
+                $n = 0; $d = 0
+                foreach ($f in $files) {
+                    try { $r = Import-SqlErrorLog $f.FullName $loc.Instance $eventLogKeys; $n += $r[0]; $d += $r[1] }
+                    catch { Write-RunLog "ERRORLOG ($($loc.Instance)) $($f.Name): $($_.Exception.Message)" }
+                }
+                Write-RunLog "ERRORLOG ($($loc.Instance)): $n entries from $(@($files).Count) file(s), $d duplicates of Application-log events skipped"
+            } else { Write-RunLog "ERRORLOG ($($loc.Instance)): folder '$($loc.ErrorLogDir)' not accessible (FCI passive node, permissions or admin share?)" }
+
+            if ($loc.AgentLogDir -and (Test-Path -LiteralPath $loc.AgentLogDir)) {
+                $files = Get-ChildItem -LiteralPath $loc.AgentLogDir -Filter 'SQLAGENT.*' -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match '^SQLAGENT\.(OUT|\d+)$' -and $_.LastWriteTime -ge $Start } | Sort-Object LastWriteTime
+                $n = 0
+                foreach ($f in $files) {
+                    try { $n += Import-SqlAgentLog $f.FullName $loc.Instance } catch { Write-RunLog "SQL Agent log ($($loc.Instance)) $($f.Name): $($_.Exception.Message)" }
+                }
+                Write-RunLog "SQL Agent log ($($loc.Instance)): $n entries from $(@($files).Count) file(s)"
+            } elseif ($loc.AgentLogDir) { Write-RunLog "SQL Agent log ($($loc.Instance)): folder '$($loc.AgentLogDir)' not accessible" }
+        }
+    }
+
+    #---- Run the selected sources ------------------------------------------------------------
+    Write-RunLog ("Collecting {0:yyyy-MM-dd HH:mm:ss} -> {1:yyyy-MM-dd HH:mm:ss}; sources: {2}" -f $Start, $End, ($Sources -join ', '))
+    if (-not $isLocal -and -not (Test-Connection -ComputerName $Computer -Count 1 -Quiet -ErrorAction SilentlyContinue)) {
+        Write-RunLog 'WARNING: host did not answer ping - trying anyway'
+    }
+    if ('System' -in $Sources) { [void](Invoke-LogQuery -LogName 'System' -Levels $problemLevels -KeyEvents $systemKeyEvents) }
+    if ('Application' -in $Sources) { [void](Invoke-LogQuery -LogName 'Application' -Levels $problemLevels -KeyEvents $appKeyEvents) }
+    if ('SQL' -in $Sources) {
+        Write-Step 'SQL Server providers'
+        $app = Get-LogInfo 'Application'
+        $sqlProviders = @(if ($app) { $app.ProviderNames | Where-Object { $_ -match $sqlProviderRx } })
+        if ($sqlProviders.Count -eq 0) { Write-RunLog 'SQL Server: no SQL providers registered in the Application log' }
+        else { [void](Invoke-LogQuery -LogName 'Application' -Label "SQL Server events ($($sqlProviders.Count) providers)" -Levels $problemLevels -Ids $sqlKeyIds -Providers $sqlProviders) }
+    }
+    if ('SQLLogs' -in $Sources) { Import-SqlLogFiles }
+    if ('Cluster' -in $Sources) {
+        if (Invoke-LogQuery -LogName 'Microsoft-Windows-FailoverClustering/Operational' -Label 'Cluster Operational' -Levels $problemLevels -Ids $clusterKeyIds) {
+            [void](Invoke-LogQuery -LogName 'System' -Label 'Cluster events in System log' -Levels @(1, 2, 3, 4) -Providers @('Microsoft-Windows-FailoverClustering'))
+            [void](Invoke-LogQuery -LogName 'Microsoft-Windows-FailoverClustering-Manager/Admin' -Label 'Cluster Manager' -Levels $problemLevels)
+            [void](Invoke-LogQuery -LogName 'Microsoft-Windows-FailoverClustering-CsvFs/Operational' -Label 'Cluster CSV' -Levels $problemLevels)
+            [void](Invoke-LogQuery -LogName 'Microsoft-Windows-ClusterAwareUpdating/Admin' -Label 'Cluster-Aware Updating' -Levels @(1, 2, 3, 4))
+            Write-RunLog 'Cluster: for deeper analysis also run Get-ClusterLog -TimeSpan <minutes> on a node'
+        }
+    }
+    if ('HyperV' -in $Sources) {
+        foreach ($l in 'Microsoft-Windows-Hyper-V-VMMS-Admin', 'Microsoft-Windows-Hyper-V-Worker-Admin', 'Microsoft-Windows-Hyper-V-High-Availability-Admin') {
+            [void](Invoke-LogQuery -LogName $l -Levels $problemLevels)
+        }
+    }
+    if ('Security' -in $Sources) { [void](Invoke-LogQuery -LogName 'Security' -Ids $securityIds) }
+    if ('OpsMgr' -in $Sources) { [void](Invoke-LogQuery -LogName 'Operations Manager' -Levels @(1, 2) -Ids $opsMgrIds) }
+
+    Write-RunLog "Done - $($results.Count) events"
+    Write-Progress -Activity "Collecting from $machine" -Completed
+    [pscustomobject]@{ Computer = $machine; Events = $results.ToArray(); Log = $runLog.ToArray() }
+}
+#endregion
+
+#region ===================== CSV / HTML export =====================
+$script:ExportColumns = 'Time', 'Computer', 'Level', 'Category', 'Tag', 'Id', 'Provider', 'LogName', 'Source', 'Message'
+
+function Export-EventCsv($Rows, [string]$Path) {
+    $Rows | Select-Object @{ n = 'Time'; e = { ([datetime]$_.Time).ToString('yyyy-MM-dd HH:mm:ss.fff') } }, Computer, Level, Category, Tag, Id, Provider, LogName, Source, Message |
+        Export-Csv -Path $Path -NoTypeInformation -UseCulture -Encoding UTF8
+}
+
+function ConvertTo-JsString([string]$s) {
+    if ($null -eq $s) { return '""' }
+    $s = $s.Replace('\', '\\').Replace('"', '\"').Replace("`r", '').Replace("`n", '\n').Replace("`t", '\t').Replace('</', '<\/')
+    return '"' + [regex]::Replace($s, '[\x00-\x1f]', '') + '"'
+}
+
+function New-HtmlReport {
+    param($Rows, [string]$Path, [datetime]$Start, [datetime]$End, [string[]]$Computers, [string[]]$RunLog, [int]$MaxRows = 50000)
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $list = @($Rows | Sort-Object { [datetime]$_.Time })
+    if ($list.Count -gt $MaxRows) { $list = $list[($list.Count - $MaxRows)..($list.Count - 1)] }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('{"meta":{"start":').Append((ConvertTo-JsString $Start.ToString('yyyy-MM-ddTHH:mm:ss', $inv)))
+    [void]$sb.Append(',"end":').Append((ConvertTo-JsString $End.ToString('yyyy-MM-ddTHH:mm:ss', $inv)))
+    [void]$sb.Append(',"generated":').Append((ConvertTo-JsString (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', $inv)))
+    [void]$sb.Append(',"computers":[').Append((($Computers | ForEach-Object { ConvertTo-JsString $_ }) -join ',')).Append(']},"ev":[')
+    $first = $true
+    foreach ($r in $list) {
+        if (-not $first) { [void]$sb.Append(',') }; $first = $false
+        $msg = [string]$r.Message; if ($msg.Length -gt 4000) { $msg = $msg.Substring(0, 4000) + ' ...' }
+        [void]$sb.Append('[').Append((ConvertTo-JsString ([datetime]$r.Time).ToString('yyyy-MM-ddTHH:mm:ss.fff', $inv))).Append(',')
+        [void]$sb.Append((ConvertTo-JsString $r.Computer)).Append(',').Append([int]$r.LevelNum).Append(',').Append((ConvertTo-JsString $r.Level)).Append(',')
+        [void]$sb.Append((ConvertTo-JsString $r.Category)).Append(',').Append((ConvertTo-JsString $r.Tag)).Append(',').Append((ConvertTo-JsString $r.Marker)).Append(',')
+        [void]$sb.Append([int]$r.Id).Append(',').Append((ConvertTo-JsString $r.Provider)).Append(',').Append((ConvertTo-JsString $r.LogName)).Append(',')
+        [void]$sb.Append((ConvertTo-JsString $msg)).Append(']')
+    }
+    [void]$sb.Append('],"log":[').Append((($RunLog | ForEach-Object { ConvertTo-JsString $_ }) -join ',')).Append(']}')
+    $title = 'Event Log Investigation - ' + ($Computers -join ', ')
+    $html = $script:HtmlTemplate.Replace('__TITLE__', [System.Net.WebUtility]::HtmlEncode($title)).Replace('__DATA__', $sb.ToString())
+    [System.IO.File]::WriteAllText($Path, $html, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+$script:HtmlTemplate = @'
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root{--bg:#1c1c1f;--panel:#26262b;--panel2:#303036;--fg:#e4e4e7;--muted:#9a9aa3;--grid:#3a3a41;--accent:#2f8cff;--c1:#e0457b;--c2:#f26b3a;--c3:#e8a317;--c4:#5b9fe3}
+@media (prefers-color-scheme: light){:root{--bg:#f5f5f7;--panel:#fff;--panel2:#eef0f3;--fg:#1d1d1f;--muted:#6b6b74;--grid:#dcdce3;--accent:#0060df;--c3:#c98a00}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.45 "Segoe UI",system-ui,sans-serif}
+header{padding:16px 20px 4px}h1{font-size:18px;margin:0 0 2px}.sub{color:var(--muted)}
+.kpis{display:flex;gap:10px;flex-wrap:wrap;padding:10px 20px}
+.kpi{background:var(--panel);border-radius:8px;padding:8px 14px;min-width:110px;border-left:4px solid var(--grid)}
+.kpi b{display:block;font-size:20px;font-variant-numeric:tabular-nums}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:8px 20px;position:sticky;top:0;background:var(--bg);z-index:3;border-bottom:1px solid var(--grid)}
+.bar label{display:flex;gap:4px;align-items:center}
+input,select,button{font:inherit;color:var(--fg);background:var(--panel);border:1px solid var(--grid);border-radius:6px;padding:4px 8px}
+button{cursor:pointer}button:hover{border-color:var(--accent)}#q{min-width:220px}
+.card{background:var(--panel);margin:12px 20px;border-radius:8px;padding:10px 12px}
+.card h2{font-size:14px;margin:0 0 6px;display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+.hint{color:var(--muted);font-size:12px;font-weight:normal}
+#tl{width:100%;display:block;user-select:none;cursor:crosshair}
+table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:4px 6px;border-bottom:1px solid var(--grid);vertical-align:top}
+th{position:sticky;top:0;background:var(--panel2);white-space:nowrap;z-index:1}td.n{text-align:right;font-variant-numeric:tabular-nums}
+td.msg{max-width:0;width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}td.t{white-space:nowrap;font-variant-numeric:tabular-nums}
+tbody tr.ev:hover,tbody tr.grp:hover{background:var(--panel2);cursor:pointer}
+tr.detail pre{white-space:pre-wrap;word-break:break-word;margin:4px 0;font:12px/1.45 Consolas,monospace}
+.l1{color:var(--c1)}.l2{color:var(--c2)}.l3{color:var(--c3)}.l4{color:var(--c4)}.lv{font-weight:600}
+.scroll{max-height:70vh;overflow:auto}pre#log{white-space:pre-wrap;font:12px Consolas,monospace;color:var(--muted)}
+svg text{fill:var(--muted);font:11px "Segoe UI",system-ui,sans-serif}
+@media (max-width:700px){header,.kpis,.bar{padding-left:12px;padding-right:12px}.card{margin:10px 12px}#q{min-width:0;flex:1}}
+</style></head><body>
+<header><h1 id="title"></h1><div class="sub" id="sub"></div></header>
+<div class="kpis" id="kpis"></div>
+<div class="bar">
+<label><input type="checkbox" data-l="1" checked><span class="l1 lv">Critical</span></label>
+<label><input type="checkbox" data-l="2" checked><span class="l2 lv">Error</span></label>
+<label><input type="checkbox" data-l="3" checked><span class="l3 lv">Warning</span></label>
+<label><input type="checkbox" data-l="4" checked><span class="l4 lv">Info</span></label>
+<select id="cat"></select><select id="comp"></select>
+<label>Lanes <select id="lane"><option value="cat">Category</option><option value="c">Computer</option><option value="p">Provider</option></select></label>
+<input id="q" type="search" placeholder="Search message, provider, tag, ID">
+<button id="back">Zoom out</button><button id="reset">Reset</button><span class="hint" id="win"></span>
+</div>
+<div class="card"><h2>Timeline <span class="hint">Drag to zoom &middot; click a bar or dot to drill in &middot; right-click to zoom out &middot; dashed lines = reboots, SQL restarts, failovers</span></h2><svg id="tl"></svg></div>
+<div class="card"><h2>Top issues <span class="hint">click a row to filter to it</span></h2><div class="scroll" style="max-height:40vh"><table id="top"></table></div></div>
+<div class="card"><h2>Events <span class="hint" id="cnt"></span></h2><div class="scroll"><table id="evt"></table></div></div>
+<div class="card"><details><summary>Collection log</summary><pre id="log"></pre></details></div>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+(function(){
+const D=JSON.parse(document.getElementById('data').textContent);
+const LV={1:'Critical',2:'Error',3:'Warning',4:'Information'};
+const MK={Boot:'#9aa0a6',Shutdown:'#7d8288',Crash:'#ff4040',SQL:'#14b8a6',AG:'#38bdf8',Cluster:'#a78bfa',Security:'#fb923c',Update:'#65a30d'};
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const E=D.ev.map((r,i)=>({i,ts:r[0],t:Date.parse(r[0]),c:r[1],l:r[2],ln:r[3],cat:r[4],tag:r[5],mk:r[6],id:r[7],p:r[8],log:r[9],m:r[10],s:(r[10]+' '+r[8]+' '+r[5]+' '+r[7]+' '+r[1]).toLowerCase()}));
+const full=[Date.parse(D.meta.start),Date.parse(D.meta.end)];
+const S={lv:{1:1,2:1,3:1,4:1},cat:'',c:'',q:'',lane:'cat',w0:full[0],w1:full[1],stack:[],open:new Set()};
+const STEPS=[10,30,60,120,300,600,900,1800,3600,7200,10800,21600,43200,86400,172800,604800];
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const p2=n=>String(n).padStart(2,'0');
+const MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function fmt(t,mode){const d=new Date(t);const hm=p2(d.getHours())+':'+p2(d.getMinutes());
+ if(mode==='d')return p2(d.getDate())+' '+MON[d.getMonth()];if(mode==='hm')return hm;if(mode==='hms')return hm+':'+p2(d.getSeconds());
+ if(mode==='dhm')return p2(d.getDate())+' '+MON[d.getMonth()]+' '+hm;return d.getFullYear()+'-'+p2(d.getMonth()+1)+'-'+p2(d.getDate())+' '+hm+':'+p2(d.getSeconds());}
+function laneOf(e){return S.lane==='c'?e.c:S.lane==='p'?e.p:e.cat;}
+function base(){const q=S.q.toLowerCase();return E.filter(e=>S.lv[e.l]&&(!S.cat||e.cat===S.cat)&&(!S.c||e.c===S.c)&&(!q||e.s.includes(q)));}
+const off=t=>-new Date(t).getTimezoneOffset()*60000;
+function alignDown(t,B){const o=off(t);return Math.floor((t+o)/B)*B-o;}
+function alignUp(t,B){const o=off(t);return Math.ceil((t+o)/B)*B-o;}
+
+$('title').textContent=document.title;
+$('sub').textContent='Window '+fmt(full[0])+' \u2192 '+fmt(full[1])+' \u00b7 generated '+D.meta.generated+' \u00b7 '+E.length.toLocaleString()+' events';
+$('log').textContent=D.log.join('\n');
+function fillSel(id,label,vals){const s=$(id);s.innerHTML='<option value="">'+label+'</option>'+[...new Set(vals)].sort().map(v=>'<option>'+esc(v)+'</option>').join('');}
+fillSel('cat','All categories',E.map(e=>e.cat));fillSel('comp','All computers',E.map(e=>e.c));
+document.querySelectorAll('[data-l]').forEach(cb=>cb.onchange=()=>{S.lv[cb.dataset.l]=cb.checked?1:0;render();});
+$('cat').onchange=e=>{S.cat=e.target.value;render();};$('comp').onchange=e=>{S.c=e.target.value;render();};
+$('lane').onchange=e=>{S.lane=e.target.value;render();};
+let qt;$('q').oninput=e=>{clearTimeout(qt);qt=setTimeout(()=>{S.q=e.target.value.trim();render();},200);};
+function zoom(a,b){S.stack.push([S.w0,S.w1]);S.w0=a;S.w1=b;render();}
+function back(){if(S.stack.length){[S.w0,S.w1]=S.stack.pop();render();}}
+$('back').onclick=back;$('reset').onclick=()=>{S.stack=[];S.w0=full[0];S.w1=full[1];render();};
+
+let G=null;
+function drawTimeline(rows){
+ const svg=$('tl');const W=Math.max(320,svg.clientWidth||900);const narrow=W<600;
+ const span=(S.w1-S.w0)/1000;const bs=STEPS.find(s=>span/s<=(narrow?60:120))||604800;const B=bs*1000;
+ const a0=alignDown(S.w0,B),a1=Math.max(alignUp(S.w1,B),a0+B);const n=Math.round((a1-a0)/B);
+ const L=narrow?90:170,R=12,T=14,H=narrow?120:170,laneH=narrow?18:20;
+ const cnt=[0,1,2,3,4].map(()=>new Array(n).fill(0));const cells=new Map();const laneN=new Map();const marks=[];
+ for(const e of rows){const b=Math.floor((e.t-a0)/B);if(b<0||b>=n)continue;cnt[e.l][b]++;
+  const ln=laneOf(e);laneN.set(ln,(laneN.get(ln)||0)+1);const k=ln+'\u0001'+b;let c=cells.get(k);
+  if(!c){c={ln,b,n:0,w:4,k:[0,0,0,0,0],top:new Map()};cells.set(k,c);}c.n++;c.k[e.l]++;if(e.l<c.w)c.w=e.l;
+  const lab=e.p+' '+e.id+(e.tag?' ('+e.tag+')':'');c.top.set(lab,(c.top.get(lab)||0)+1);}
+ for(const e of E){if(e.mk&&e.t>=S.w0&&e.t<S.w1&&(!S.cat||e.cat===S.cat)&&(!S.c||e.c===S.c))marks.push(e);}
+ let lanes=[...laneN.entries()].sort((x,y)=>y[1]-x[1]);if(lanes.length>30){const keep=new Set(lanes.slice(0,29).map(x=>x[0]));
+  for(const c of [...cells.values()])if(!keep.has(c.ln)){cells.delete(c.ln+'\u0001'+c.b);const k='(other)\u0001'+c.b;let o=cells.get(k);
+   if(!o){o={ln:'(other)',b:c.b,n:0,w:4,k:[0,0,0,0,0],top:new Map()};cells.set(k,o);}o.n+=c.n;o.w=Math.min(o.w,c.w);for(let i=1;i<5;i++)o.k[i]+=c.k[i];}
+  lanes=lanes.slice(0,29).concat([['(other)',0]]);}
+ const laneNames=lanes.map(x=>x[0]).sort((x,y)=>x==='(other)'?1:y==='(other)'?-1:x.localeCompare(y));const li=new Map(laneNames.map((x,i)=>[x,i]));
+ const laneTop=T+H+26,Ht=laneTop+Math.max(1,laneNames.length)*laneH+8;
+ const X=t=>L+(t-a0)/(a1-a0)*(W-L-R);const bw=(W-L-R)/n;
+ let mx=1;for(let b=0;b<n;b++){let s=0;for(let l=1;l<5;l++)s+=cnt[l][b];if(s>mx)mx=s;}
+ const nice=v=>{const p=Math.pow(10,Math.floor(Math.log10(v)));const f=v/p;return (f<=1?1:f<=2?2:f<=5?5:10)*p;};const ymax=Math.max(4,nice(mx));
+ const Y=v=>T+H-v/ymax*H;const col={1:css('--c1'),2:css('--c2'),3:css('--c3'),4:css('--c4')};const grid=css('--grid');
+ let s='';
+ for(let i=0;i<=4;i++){const v=ymax*i/4,y=Y(v);s+=`<line x1="${L}" x2="${W-R}" y1="${y}" y2="${y}" stroke="${grid}"/><text x="${L-6}" y="${y+4}" text-anchor="end">${Math.round(v)}</text>`;}
+ for(let b=0;b<n;b++){let acc=0;const x=X(a0+b*B)+Math.max(0.5,bw*0.06),w=Math.max(1,bw*0.88);
+  for(const l of [1,2,3,4]){const v=cnt[l][b];if(!v)continue;const y0=Y(acc),y1=Y(acc+v);acc+=v;
+   s+=`<rect x="${x}" y="${y1}" width="${w}" height="${Math.max(0.5,y0-y1)}" fill="${col[l]}"><title>${fmt(a0+b*B,'dhm')} \u2013 ${fmt(a0+(b+1)*B,'hm')}\n${LV[l]}: ${v}</title></rect>`;}}
+ const tickTarget=Math.max(2,Math.floor((W-L-R)/(narrow?80:110)));const ts=STEPS.find(x=>span/x<=tickTarget&&x>=bs)||604800;
+ const tf=ts>=86400?'d':span>86400?'dhm':ts<60?'hms':'hm';
+ for(let t=alignUp(a0,ts*1000);t<=a1;t+=ts*1000){const x=X(t);s+=`<line x1="${x}" x2="${x}" y1="${T}" y2="${Ht-6}" stroke="${grid}" stroke-dasharray="2 4"/><text x="${x}" y="${T+H+16}" text-anchor="middle">${fmt(t,tf)}</text>`;}
+ s+=`<line x1="${L}" x2="${W-R}" y1="${T+H}" y2="${T+H}" stroke="${css('--muted')}"/>`;
+ laneNames.forEach((ln,i)=>{const y=laneTop+i*laneH;if(i%2===0)s+=`<rect x="${L}" y="${y}" width="${W-L-R}" height="${laneH}" fill="${css('--panel2')}" opacity="0.6"/>`;
+  const lab=ln.length>(narrow?12:26)?ln.slice(0,narrow?11:25)+'\u2026':ln;s+=`<text x="${L-6}" y="${y+laneH/2+4}" text-anchor="end"><title>${esc(ln)}</title>${esc(lab)}</text>`;});
+ for(const c of cells.values()){const i=li.get(c.ln);if(i==null)continue;const cx=X(a0+(c.b+0.5)*B),cy=laneTop+i*laneH+laneH/2;const r=Math.min(laneH/2-1,2.5+2.2*Math.log10(c.n+1)*1.6);
+  const top=[...c.top.entries()].sort((x,y)=>y[1]-x[1]).slice(0,3).map(x=>x[1]+'\u00d7 '+x[0]).join('\n');
+  s+=`<circle cx="${cx}" cy="${cy}" r="${r}" fill="${col[c.w]}" fill-opacity="0.85"><title>${esc(c.ln)} \u00b7 ${fmt(a0+c.b*B,'dhm')}\n${c.n} events (${c.k[1]} critical, ${c.k[2]} error, ${c.k[3]} warning, ${c.k[4]} info)\n${esc(top)}</title></circle>`;}
+ marks.sort((x,y)=>x.t-y.t);const last=new Map();const gap=Math.max(300000,B);
+ for(const m of marks){const k=m.c+'|'+m.mk;if(last.has(k)&&m.t-last.get(k)<gap)continue;last.set(k,m.t);const x=X(m.t),c=MK[m.mk]||'#888';
+  s+=`<g><line x1="${x}" x2="${x}" y1="${T-4}" y2="${Ht-6}" stroke="${c}" stroke-width="1.6" stroke-dasharray="5 3"/><path d="M${x-5},${T-12}h10l-5,7z" fill="${c}"/><title>${fmt(m.t)} \u00b7 ${esc(m.c)}\n${esc(m.tag||m.mk)}</title></g>`;}
+ s+=`<rect id="brush" x="0" y="${T}" width="0" height="${Ht-T-6}" fill="${css('--accent')}" opacity="0.18" pointer-events="none"/>`;
+ svg.setAttribute('viewBox',`0 0 ${W} ${Ht}`);svg.setAttribute('height',Ht);svg.innerHTML=s;
+ G={a0,a1,B,n,L,R,W,T,H,laneTop,laneH,laneNames,X,tot:Array.from({length:n},(_,b)=>cnt[1][b]+cnt[2][b]+cnt[3][b]+cnt[4][b])};
+}
+const svg=$('tl');let drag=null;
+function px(ev){const r=svg.getBoundingClientRect();return{x:(ev.clientX-r.left)*G.W/r.width,y:(ev.clientY-r.top)*G.W/r.width};}
+const tAt=x=>G.a0+(Math.min(Math.max(x,G.L),G.W-G.R)-G.L)/(G.W-G.L-G.R)*(G.a1-G.a0);
+svg.addEventListener('mousedown',ev=>{if(ev.button!==0||!G)return;const p=px(ev);if(p.x<G.L)return;drag={x0:p.x,x1:p.x,y:p.y};ev.preventDefault();});
+window.addEventListener('mousemove',ev=>{if(!drag)return;drag.x1=px(ev).x;const b=$('brush');if(b){b.setAttribute('x',Math.min(drag.x0,drag.x1));b.setAttribute('width',Math.abs(drag.x1-drag.x0));}});
+window.addEventListener('mouseup',()=>{if(!drag)return;const d=drag;drag=null;
+ if(Math.abs(d.x1-d.x0)>5){const a=tAt(Math.min(d.x0,d.x1)),b=tAt(Math.max(d.x0,d.x1));zoom(a,b);return;}
+ let b=Math.floor((tAt(d.x0)-G.a0)/G.B);if(b<0||b>=G.n)return;
+ if(!G.tot[b]){if(G.tot[b-1])b--;else if(G.tot[b+1])b++;}
+ if(d.y>=G.laneTop){const i=Math.floor((d.y-G.laneTop)/G.laneH);const ln=G.laneNames[i];
+  if(ln&&ln!=='(other)'){if(S.lane==='cat'){S.cat=ln;$('cat').value=ln;}else if(S.lane==='c'){S.c=ln;$('comp').value=ln;}else{S.q=ln;$('q').value=ln;}}}
+ zoom(G.a0+b*G.B,G.a0+(b+1)*G.B);});
+svg.addEventListener('contextmenu',ev=>{ev.preventDefault();back();});
+window.addEventListener('resize',()=>{clearTimeout(window.__rt);window.__rt=setTimeout(render,150);});
+
+function drawTop(rows){const g=new Map();
+ for(const e of rows){const k=e.cat+'\u0001'+e.p+'\u0001'+e.id;let o=g.get(k);if(!o){o={cat:e.cat,p:e.p,id:e.id,n:0,w:4,f:e.t,la:e.t,tag:e.tag,cs:new Set(),m:e.m};g.set(k,o);}
+  o.n++;if(e.l<o.w)o.w=e.l;if(e.t<o.f)o.f=e.t;if(e.t>o.la)o.la=e.t;o.cs.add(e.c);}
+ const list=[...g.values()].sort((a,b)=>a.w-b.w||b.n-a.n).slice(0,200);
+ $('top').innerHTML='<thead><tr><th>Count</th><th>Level</th><th>Category</th><th>Provider</th><th>ID</th><th>Description</th><th>First</th><th>Last</th><th>Hosts</th><th>Sample message</th></tr></thead><tbody>'+
+  list.map((o,i)=>`<tr class="grp" data-g="${i}"><td class="n">${o.n}</td><td class="lv l${o.w}">${LV[o.w]}</td><td>${esc(o.cat)}</td><td>${esc(o.p)}</td><td class="n">${o.id}</td><td>${esc(o.tag)}</td><td class="t">${fmt(o.f,'dhm')}</td><td class="t">${fmt(o.la,'dhm')}</td><td class="n">${o.cs.size}</td><td class="msg" title="${esc(o.m.slice(0,600))}">${esc(o.m.slice(0,300))}</td></tr>`).join('')+'</tbody>';
+ $('top').onclick=ev=>{const tr=ev.target.closest('tr.grp');if(!tr)return;const o=list[+tr.dataset.g];S.cat=o.cat;$('cat').value=o.cat;S.q=String(o.id);$('q').value=S.q;render();};
+}
+function drawTable(rows){const MAX=2000;const show=rows.length>MAX?rows.slice(rows.length-MAX):rows;
+ $('cnt').textContent=rows.length.toLocaleString()+' events in window'+(rows.length>MAX?' \u2014 showing the latest '+MAX+'; zoom or filter to narrow down':'');
+ let h='<thead><tr><th>Time</th><th>Computer</th><th>Level</th><th>Category</th><th>Description</th><th>ID</th><th>Provider</th><th>Message</th></tr></thead><tbody>';
+ for(const e of show){h+=`<tr class="ev" data-i="${e.i}"><td class="t">${esc(e.ts.replace('T',' '))}</td><td>${esc(e.c)}</td><td class="lv l${e.l}">${esc(e.ln)}</td><td>${esc(e.cat)}</td><td>${esc(e.tag)}</td><td class="n">${e.id}</td><td>${esc(e.p)}</td><td class="msg">${esc(e.m.slice(0,300))}</td></tr>`;
+  if(S.open.has(e.i))h+=`<tr class="detail"><td colspan="8"><pre>${esc(e.log)}\n\n${esc(e.m)}</pre></td></tr>`;}
+ $('evt').innerHTML=h+'</tbody>';
+ $('evt').onclick=ev=>{const tr=ev.target.closest('tr.ev');if(!tr)return;const i=+tr.dataset.i;if(S.open.has(i))S.open.delete(i);else S.open.add(i);drawTable(rows);};
+}
+function kpis(rows){const k=[0,0,0,0,0];rows.forEach(e=>k[e.l]++);const mk=rows.filter(e=>e.mk).length;
+ const t=(lab,v,c)=>`<div class="kpi" style="border-left-color:${c}">${lab}<b>${v.toLocaleString()}</b></div>`;
+ $('kpis').innerHTML=t('Critical',k[1],css('--c1'))+t('Error',k[2],css('--c2'))+t('Warning',k[3],css('--c3'))+t('Information',k[4],css('--c4'))+t('Key events',mk,'#a78bfa')+t('Computers',new Set(rows.map(e=>e.c)).size,css('--grid'));}
+function render(){const rows=base().filter(e=>e.t>=S.w0&&e.t<S.w1);drawTimeline(rows);drawTop(rows);drawTable(rows);kpis(rows);
+ $('win').textContent=fmt(S.w0)+' \u2192 '+fmt(S.w1);}
+render();
+})();
+</script></body></html>
+'@
+#endregion
+
+#region ===================== Headless mode =====================
+if ($NoGui) {
+    $allEvents = New-Object System.Collections.Generic.List[object]
+    $allLog = New-Object System.Collections.Generic.List[string]
+    foreach ($c in $ComputerName) {
+        $r = & $Collector $c $StartTime $EndTime $Sources $MaxEventsPerQuery ([bool]$IncludeInformation)
+        if ($r) { $allEvents.AddRange([object[]]$r.Events); $allLog.AddRange([string[]]$r.Log) }
+    }
+    $allLog | ForEach-Object { Write-Verbose $_ -Verbose:($VerbosePreference -ne 'SilentlyContinue') }
+    $sorted = $allEvents | Sort-Object Time
+    if ($OutputPath) {
+        if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
+        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $csv = Join-Path $OutputPath "EventLogInvestigation_$stamp.csv"
+        $htmlPath = Join-Path $OutputPath "EventLogInvestigation_$stamp.html"
+        $logPath = Join-Path $OutputPath "EventLogInvestigation_$stamp.log"
+        Export-EventCsv $sorted $csv
+        New-HtmlReport -Rows $sorted -Path $htmlPath -Start $StartTime -End $EndTime -Computers $ComputerName -RunLog $allLog
+        $allLog | Set-Content -Path $logPath -Encoding UTF8
+        $allLog | ForEach-Object { Write-Host $_ }
+        Write-Host "`n$($allEvents.Count) events written to:`n  $csv`n  $htmlPath`n  $logPath"
+    } else {
+        $allLog | ForEach-Object { Write-Host $_ }
+        $sorted
+    }
+    return
+}
+#endregion
+
+#region ===================== GUI =====================
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms.DataVisualization
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+$theme = @{
+    FormBackground          = [System.Drawing.Color]::FromArgb(45, 45, 48)
+    FilterBackground        = [System.Drawing.Color]::FromArgb(37, 37, 40)
+    ControlBackground       = [System.Drawing.Color]::FromArgb(60, 60, 63)
+    ControlForeground       = [System.Drawing.Color]::FromArgb(220, 220, 220)
+    MutedForeground         = [System.Drawing.Color]::FromArgb(150, 150, 155)
+    ButtonBackground        = [System.Drawing.Color]::FromArgb(80, 80, 85)
+    ButtonForeground        = [System.Drawing.Color]::FromArgb(240, 240, 240)
+    GridBackground          = [System.Drawing.Color]::FromArgb(50, 50, 53)
+    GridForeground          = [System.Drawing.Color]::FromArgb(210, 210, 210)
+    GridLines               = [System.Drawing.Color]::FromArgb(72, 72, 76)
+    GridHeaderBackground    = [System.Drawing.Color]::FromArgb(70, 70, 73)
+    GridHeaderForeground    = [System.Drawing.Color]::White
+    GridCellBackground      = [System.Drawing.Color]::FromArgb(60, 60, 63)
+    GridAltCellBackground   = [System.Drawing.Color]::FromArgb(65, 65, 68)
+    GridSelectionBackground = [System.Drawing.Color]::FromArgb(0, 122, 204)
+    GridSelectionForeground = [System.Drawing.Color]::White
+    AccentColor             = [System.Drawing.Color]::FromArgb(0, 122, 204)
+}
+$levelColors = @{
+    1 = [System.Drawing.Color]::FromArgb(224, 69, 123)   # Critical
+    2 = [System.Drawing.Color]::FromArgb(242, 107, 58)   # Error
+    3 = [System.Drawing.Color]::FromArgb(232, 163, 23)   # Warning
+    4 = [System.Drawing.Color]::FromArgb(91, 159, 227)   # Information
+}
+$levelNames = @{ 1 = 'Critical'; 2 = 'Error'; 3 = 'Warning'; 4 = 'Information' }
+$markerColors = @{
+    Boot = [System.Drawing.Color]::FromArgb(200, 200, 205); Shutdown = [System.Drawing.Color]::FromArgb(140, 140, 145)
+    Crash = [System.Drawing.Color]::FromArgb(255, 64, 64); SQL = [System.Drawing.Color]::FromArgb(20, 184, 166)
+    AG = [System.Drawing.Color]::FromArgb(56, 189, 248); Cluster = [System.Drawing.Color]::FromArgb(167, 139, 250)
+    Security = [System.Drawing.Color]::FromArgb(251, 146, 60); Update = [System.Drawing.Color]::FromArgb(101, 163, 13)
+}
+$timeFrames = @(
+    [PSCustomObject]@{ Name = 'Last 1 hour'; Hours = 1 }, [PSCustomObject]@{ Name = 'Last 6 hours'; Hours = 6 },
+    [PSCustomObject]@{ Name = 'Last 12 hours'; Hours = 12 }, [PSCustomObject]@{ Name = 'Last 24 hours'; Hours = 24 },
+    [PSCustomObject]@{ Name = 'Last 48 hours'; Hours = 48 }, [PSCustomObject]@{ Name = 'Last 3 days'; Hours = 72 },
+    [PSCustomObject]@{ Name = 'Last 7 days'; Hours = 168 }, [PSCustomObject]@{ Name = 'Last 14 days'; Hours = 336 },
+    [PSCustomObject]@{ Name = 'Last 30 days'; Hours = 720 }, [PSCustomObject]@{ Name = 'Custom range'; Hours = 0 }
+)
+$script:BucketSteps = 10, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800
+
+# --- State ---
+$script:Jobs = @()
+$script:RunLog = @()
+$script:CollectStart = $null; $script:CollectEnd = $null
+$script:ViewStart = $null; $script:ViewEnd = $null
+$script:ZoomStack = New-Object System.Collections.Stack
+$script:SuspendFilter = $false
+$script:SettingRange = $false
+$script:ChartDownX = 0
+$script:LaneNames = @()
+
+$script:Table = New-Object System.Data.DataTable 'Events'
+foreach ($c in @(@('Key', [int]), @('Time', [datetime]), @('Computer', [string]), @('Level', [string]), @('LevelNum', [int]), @('Category', [string]),
+        @('Tag', [string]), @('Marker', [string]), @('Id', [int]), @('Provider', [string]), @('LogName', [string]), @('Source', [string]),
+        @('RecordId', [long]), @('Summary', [string]), @('Message', [string]))) { [void]$script:Table.Columns.Add($c[0], $c[1]) }
+$script:View = New-Object System.Data.DataView($script:Table)
+$script:View.Sort = 'Time ASC'
+
+$script:SummaryTable = New-Object System.Data.DataTable 'Summary'
+foreach ($c in @(@('Count', [int]), @('Level', [string]), @('LevelNum', [int]), @('Category', [string]), @('Provider', [string]), @('Id', [int]),
+        @('Tag', [string]), @('First', [datetime]), @('Last', [datetime]), @('Computers', [int]), @('Sample', [string]))) { [void]$script:SummaryTable.Columns.Add($c[0], $c[1]) }
+$script:SummaryView = New-Object System.Data.DataView($script:SummaryTable)
+$script:SummaryView.Sort = 'LevelNum ASC, Count DESC'
+
+# --- Control helpers ---
+function New-Label([string]$Text) {
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text = $Text; $l.AutoSize = $true; $l.ForeColor = $theme.ControlForeground
+    $l.Margin = New-Object System.Windows.Forms.Padding(8, 8, 2, 0)
+    $l
+}
+function New-Button([string]$Text, [int]$Width = 90) {
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $Text; $b.Size = New-Object System.Drawing.Size($Width, 27)
+    $b.BackColor = $theme.ButtonBackground; $b.ForeColor = $theme.ButtonForeground
+    $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat; $b.FlatAppearance.BorderColor = $theme.AccentColor; $b.FlatAppearance.BorderSize = 1
+    $b.Margin = New-Object System.Windows.Forms.Padding(4, 3, 2, 3)
+    $b
+}
+function New-CheckBox([string]$Text, [bool]$Checked, $Color = $null) {
+    $c = New-Object System.Windows.Forms.CheckBox
+    $c.Text = $Text; $c.AutoSize = $true; $c.Checked = $Checked
+    $c.ForeColor = if ($Color) { $Color } else { $theme.ControlForeground }
+    $c.Margin = New-Object System.Windows.Forms.Padding(6, 7, 2, 0)
+    $c
+}
+function New-ComboBox([int]$Width, [object[]]$Items) {
+    $c = New-Object System.Windows.Forms.ComboBox
+    $c.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList; $c.Width = $Width
+    $c.BackColor = $theme.ControlBackground; $c.ForeColor = $theme.ControlForeground; $c.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $c.Margin = New-Object System.Windows.Forms.Padding(2, 4, 2, 2)
+    foreach ($i in $Items) { [void]$c.Items.Add($i) }
+    $c
+}
+function New-TextBox([int]$Width, [string]$Text = '') {
+    $t = New-Object System.Windows.Forms.TextBox
+    $t.Width = $Width; $t.Text = $Text
+    $t.BackColor = $theme.ControlBackground; $t.ForeColor = $theme.ControlForeground; $t.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $t.Margin = New-Object System.Windows.Forms.Padding(2, 5, 2, 2)
+    $t
+}
+function New-FlowPanel($BackColor) {
+    $p = New-Object System.Windows.Forms.FlowLayoutPanel
+    $p.Dock = [System.Windows.Forms.DockStyle]::Top; $p.AutoSize = $true; $p.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $p.WrapContents = $true; $p.BackColor = $BackColor; $p.Padding = New-Object System.Windows.Forms.Padding(4, 4, 4, 4)
+    $p
+}
+function Set-DoubleBuffered($Control) {
+    $Control.GetType().GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'NonPublic,Instance').SetValue($Control, $true, $null)
+}
+
+# --- Form ---
 $mainForm = New-Object System.Windows.Forms.Form
-$mainForm.Text = "Windows Event Log Investigator"
-$mainForm.Size = New-Object System.Drawing.Size(1000, 700)
-$mainForm.MinimumSize = New-Object System.Drawing.Size(800, 500)
+$mainForm.Text = 'Windows Event Log Investigator'
+$mainForm.Size = New-Object System.Drawing.Size(1400, 900)
+$mainForm.MinimumSize = New-Object System.Drawing.Size(900, 600)
 $mainForm.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
 $mainForm.BackColor = $theme.FormBackground
 $mainForm.ForeColor = $theme.ControlForeground
-$mainForm.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$mainForm.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$toolTip = New-Object System.Windows.Forms.ToolTip
 
-$topPanel = New-Object System.Windows.Forms.Panel
-$topPanel.Height = 90 
-$topPanel.Dock = [System.Windows.Forms.DockStyle]::Top 
-$topPanel.BackColor = $theme.FormBackground
-$topPanel.Padding = New-Object System.Windows.Forms.Padding(5) 
+# Row 1 + 2: what / when / where to collect
+$pnlCollect = New-FlowPanel $theme.FormBackground
+$lblComputers = New-Label 'Computers:'
+$txtComputers = New-TextBox 230 ($ComputerName -join ', ')
+$toolTip.SetToolTip($txtComputers, 'Comma separated list of servers to collect from (e.g. all nodes of a cluster).')
+$btnClusterNodes = New-Button '+ Cluster nodes' 110
+$toolTip.SetToolTip($btnClusterNodes, 'Add every node of the cluster that the first computer belongs to.')
+$lblRange = New-Label 'Range:'
+$cmbRange = New-ComboBox 120 ($timeFrames | ForEach-Object { $_.Name })
+$lblFrom = New-Label 'From:'
+$dtpFrom = New-Object System.Windows.Forms.DateTimePicker
+$lblTo = New-Label 'To:'
+$dtpTo = New-Object System.Windows.Forms.DateTimePicker
+foreach ($d in $dtpFrom, $dtpTo) {
+    $d.Format = [System.Windows.Forms.DateTimePickerFormat]::Custom; $d.CustomFormat = 'yyyy-MM-dd HH:mm:ss'; $d.Width = 150
+    $d.Margin = New-Object System.Windows.Forms.Padding(2, 4, 2, 2)
+    $d.MinDate = (Get-Date).AddYears(-20); $d.MaxDate = (Get-Date).AddYears(1)
+}
+$btnCollect = New-Button 'Collect' 90
+$btnCollect.BackColor = $theme.AccentColor
+$btnCancel = New-Button 'Cancel' 70
+$btnCancel.Enabled = $false
+$pnlCollect.Controls.AddRange(@($lblComputers, $txtComputers, $btnClusterNodes, $lblRange, $cmbRange, $lblFrom, $dtpFrom, $lblTo, $dtpTo, $btnCollect, $btnCancel))
+$pnlCollect.SetFlowBreak($btnCancel, $true)
 
-$lblTimeFrame = New-Object System.Windows.Forms.Label; $lblTimeFrame.Text = "Time Frame:"; $lblTimeFrame.Location = New-Object System.Drawing.Point(10, 15); $lblTimeFrame.AutoSize = $true
-$cmbTimeFrame = New-Object System.Windows.Forms.ComboBox; $cmbTimeFrame.Location = New-Object System.Drawing.Point(90, 12); $cmbTimeFrame.Size = New-Object System.Drawing.Size(170, 25); $cmbTimeFrame.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList; $timeFrames | ForEach-Object { [void]$cmbTimeFrame.Items.Add($_.Name) }; $cmbTimeFrame.SelectedIndex = 2; $cmbTimeFrame.BackColor = $theme.ControlBackground; $cmbTimeFrame.ForeColor = $theme.ControlForeground; $cmbTimeFrame.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-$btnGetEvents = New-Object System.Windows.Forms.Button; $btnGetEvents.Text = "Get Events"; $btnGetEvents.Location = New-Object System.Drawing.Point(([int]$cmbTimeFrame.Right + 20), 10); $btnGetEvents.Size = New-Object System.Drawing.Size(100, 30); $btnGetEvents.BackColor = $theme.ButtonBackground; $btnGetEvents.ForeColor = $theme.ButtonForeground; $btnGetEvents.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat; $btnGetEvents.FlatAppearance.BorderColor = $theme.AccentColor; $btnGetEvents.FlatAppearance.BorderSize = 1
-$btnExportOpen = New-Object System.Windows.Forms.Button; $btnExportOpen.Text = "View in CSV"; $btnExportOpen.Location = New-Object System.Drawing.Point(([int]$btnGetEvents.Right + 10), 10); $btnExportOpen.Size = New-Object System.Drawing.Size(120, 30); $btnExportOpen.BackColor = $theme.ButtonBackground; $btnExportOpen.ForeColor = $theme.ButtonForeground; $btnExportOpen.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat; $btnExportOpen.FlatAppearance.BorderColor = $theme.AccentColor; $btnExportOpen.FlatAppearance.BorderSize = 1
+$lblSources = New-Label 'Sources:'
+$chkSrcSystem = New-CheckBox 'System' ('System' -in $Sources)
+$chkSrcApp = New-CheckBox 'Application' ('Application' -in $Sources)
+$chkSrcSql = New-CheckBox 'SQL Server events' ('SQL' -in $Sources)
+$chkSrcSqlLogs = New-CheckBox 'SQL ERRORLOG + Agent log' ('SQLLogs' -in $Sources)
+$chkSrcCluster = New-CheckBox 'Failover Cluster' ('Cluster' -in $Sources)
+$chkSrcHyperV = New-CheckBox 'Hyper-V' ('HyperV' -in $Sources)
+$chkSrcSecurity = New-CheckBox 'Security audit' ('Security' -in $Sources)
+$chkSrcOpsMgr = New-CheckBox 'OpsMgr' ('OpsMgr' -in $Sources)
+$chkIncludeInfo = New-CheckBox 'All Information events (noisy)' ([bool]$IncludeInformation) $theme.MutedForeground
+$lblMax = New-Label 'Max/query:'
+$nudMax = New-Object System.Windows.Forms.NumericUpDown
+$nudMax.Minimum = 100; $nudMax.Maximum = 1000000; $nudMax.Increment = 1000; $nudMax.Value = $MaxEventsPerQuery; $nudMax.Width = 80
+$nudMax.BackColor = $theme.ControlBackground; $nudMax.ForeColor = $theme.ControlForeground; $nudMax.Margin = New-Object System.Windows.Forms.Padding(2, 5, 2, 2)
+$toolTip.SetToolTip($chkSrcSql, 'All SQL Server providers in the Application log (every instance, Agent, SSIS, SSRS, VSS writer...) incl. key informational events: restarts, AG role changes, login failures, slow I/O...')
+$toolTip.SetToolTip($chkSrcSqlLogs, 'Parses ERRORLOG / SQLAGENT.OUT files for every instance found in the registry (remote: Remote Registry + admin shares).')
+$toolTip.SetToolTip($chkSrcCluster, 'FailoverClustering Operational, Manager, CSV and Cluster-Aware Updating logs plus cluster events in the System log.')
+$toolTip.SetToolTip($chkIncludeInfo, 'Key informational events (reboots, failovers, SQL restarts, patching) are always collected. Tick this to collect every Information event as well.')
+$pnlCollect.Controls.AddRange(@($lblSources, $chkSrcSystem, $chkSrcApp, $chkSrcSql, $chkSrcSqlLogs, $chkSrcCluster, $chkSrcHyperV, $chkSrcSecurity, $chkSrcOpsMgr, $chkIncludeInfo, $lblMax, $nudMax))
 
-$chkClusterEvents = New-Object System.Windows.Forms.CheckBox; $chkClusterEvents.Text = "Cluster"; $chkClusterEvents.Location = New-Object System.Drawing.Point(10, 52); $chkClusterEvents.AutoSize = $true; $chkClusterEvents.Checked = $false; $chkClusterEvents.ForeColor = $theme.ControlForeground
-$chkOpsManagerEvents = New-Object System.Windows.Forms.CheckBox; $chkOpsManagerEvents.Text = "OpsMgr"; $chkOpsManagerEvents.AutoSize = $true; $chkOpsManagerEvents.Checked = $false; $chkOpsManagerEvents.ForeColor = $theme.ControlForeground
-$chkSqlEvents = New-Object System.Windows.Forms.CheckBox; $chkSqlEvents.Text = "SQL"; $chkSqlEvents.AutoSize = $true; $chkSqlEvents.Checked = $false; $chkSqlEvents.ForeColor = $theme.ControlForeground
+# Row 3: filters for what is displayed
+$pnlFilter = New-FlowPanel $theme.FilterBackground
+$lblShow = New-Label 'Show:'
+$chkCrit = New-CheckBox 'Critical' $true $levelColors[1]
+$chkErr = New-CheckBox 'Error' $true $levelColors[2]
+$chkWarn = New-CheckBox 'Warning' $true $levelColors[3]
+$chkInfo = New-CheckBox 'Info' $true $levelColors[4]
+$lblCategory = New-Label 'Category:'
+$cmbCategory = New-ComboBox 150 @('(All)')
+$lblComputer = New-Label 'Computer:'
+$cmbComputer = New-ComboBox 120 @('(All)')
+$lblLanes = New-Label 'Lanes:'
+$cmbLanes = New-ComboBox 130 @('Category', 'Computer', 'Computer + Category', 'Provider')
+$lblIds = New-Label 'Event IDs:'
+$txtIds = New-TextBox 110
+$toolTip.SetToolTip($txtIds, "Comma/space separated. E.g. '1069, 1135' or '-7036' to exclude.")
+$lblSearch = New-Label 'Search:'
+$txtSearch = New-TextBox 170
+$toolTip.SetToolTip($txtSearch, 'Searches message, provider, description and computer.')
+$btnClearFilter = New-Button 'Clear' 55
+$btnZoomOut = New-Button 'Zoom out' 75
+$btnResetZoom = New-Button 'Reset zoom' 85
+$btnOpenCsv = New-Button 'Open in Excel' 100
+$btnExportCsv = New-Button 'Save CSV...' 85
+$btnHtml = New-Button 'HTML report...' 105
+$toolTip.SetToolTip($btnHtml, 'Save a self-contained interactive HTML report (timeline, top issues, events) to share.')
+$pnlFilter.Controls.AddRange(@($lblShow, $chkCrit, $chkErr, $chkWarn, $chkInfo, $lblCategory, $cmbCategory, $lblComputer, $cmbComputer, $lblLanes, $cmbLanes,
+        $lblIds, $txtIds, $lblSearch, $txtSearch, $btnClearFilter, $btnZoomOut, $btnResetZoom, $btnOpenCsv, $btnExportCsv, $btnHtml))
+$cmbCategory.SelectedIndex = 0; $cmbComputer.SelectedIndex = 0; $cmbLanes.SelectedIndex = 0
 
-$lblFilterEventID = New-Object System.Windows.Forms.Label; $lblFilterEventID.Text = "Filter IDs:"; $lblFilterEventID.AutoSize = $true
-$txtFilterEventID = New-Object System.Windows.Forms.TextBox; $txtFilterEventID.Size = New-Object System.Drawing.Size(150, 25); $txtFilterEventID.BackColor = $theme.ControlBackground; $txtFilterEventID.ForeColor = $theme.ControlForeground; $txtFilterEventID.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-$lblFilterHelp = New-Object System.Windows.Forms.Label; $lblFilterHelp.Text = "(?)"; $lblFilterHelp.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold); $lblFilterHelp.AutoSize = $true
-$filterToolTip = New-Object System.Windows.Forms.ToolTip; $filterToolTip.SetToolTip($lblFilterHelp, "IDs: comma/space separated. E.g., '1001, -7036'"); $filterToolTip.SetToolTip($txtFilterEventID, "E.g., '1001, 4624' or '-7036' to exclude.")
-$btnClearFilter = New-Object System.Windows.Forms.Button; $btnClearFilter.Text = "Clear"; $btnClearFilter.Size = New-Object System.Drawing.Size(70, 28); $btnClearFilter.BackColor = $theme.ButtonBackground; $btnClearFilter.ForeColor = $theme.ButtonForeground; $btnClearFilter.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat; $btnClearFilter.FlatAppearance.BorderColor = $theme.AccentColor; $btnClearFilter.FlatAppearance.BorderSize = 1
+# --- Timeline chart ---
+$chart = New-Object System.Windows.Forms.DataVisualization.Charting.Chart
+$chart.Dock = [System.Windows.Forms.DockStyle]::Fill
+$chart.BackColor = $theme.GridBackground
+$chart.AntiAliasing = [System.Windows.Forms.DataVisualization.Charting.AntiAliasingStyles]::All
+$caCounts = New-Object System.Windows.Forms.DataVisualization.Charting.ChartArea 'Counts'
+$caLanes = New-Object System.Windows.Forms.DataVisualization.Charting.ChartArea 'Lanes'
+foreach ($ca in $caCounts, $caLanes) {
+    $ca.BackColor = $theme.GridBackground
+    foreach ($ax in $ca.AxisX, $ca.AxisY) {
+        $ax.LineColor = $theme.GridLines; $ax.MajorGrid.LineColor = $theme.GridLines; $ax.MajorTickMark.LineColor = $theme.GridLines
+        $ax.LabelStyle.ForeColor = $theme.ControlForeground; $ax.LabelStyle.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+    }
+    $ca.AxisX.IntervalAutoMode = [System.Windows.Forms.DataVisualization.Charting.IntervalAutoMode]::VariableCount
+    $ca.AxisX.MajorGrid.LineDashStyle = [System.Windows.Forms.DataVisualization.Charting.ChartDashStyle]::Dot
+    $ca.Position.Auto = $false; $ca.Position.X = 0; $ca.Position.Width = 99
+}
+$caCounts.Position.Y = 13; $caCounts.Position.Height = 44
+$caLanes.Position.Y = 57; $caLanes.Position.Height = 43
+$caCounts.AxisX.LabelStyle.Enabled = $false
+$caCounts.AxisY.Minimum = 0
+$caCounts.AxisY.LabelStyle.Format = 'N0'
+$caCounts.AxisY.Title = 'Events'; $caCounts.AxisY.TitleForeColor = $theme.MutedForeground
+$caCounts.CursorX.IsUserSelectionEnabled = $true
+$caCounts.CursorX.IntervalType = [System.Windows.Forms.DataVisualization.Charting.DateTimeIntervalType]::Seconds
+$caCounts.CursorX.Interval = 1
+$caCounts.CursorX.SelectionColor = [System.Drawing.Color]::FromArgb(90, 0, 122, 204)
+$caCounts.CursorX.LineColor = $theme.AccentColor
+$caCounts.AxisX.ScaleView.Zoomable = $false
+$caLanes.AxisY.MajorGrid.Enabled = $false
+$caLanes.AxisY.MajorTickMark.Enabled = $false
+$caLanes.AlignWithChartArea = 'Counts'
+$caLanes.AlignmentOrientation = [System.Windows.Forms.DataVisualization.Charting.AreaAlignmentOrientations]::Vertical
+$caLanes.AlignmentStyle = [System.Windows.Forms.DataVisualization.Charting.AreaAlignmentStyles]::PlotPosition
+$chart.ChartAreas.Add($caCounts); $chart.ChartAreas.Add($caLanes)
 
-$mainForm.Add_Shown({ 
-    $chkOpsManagerEvents.Location = New-Object System.Drawing.Point(([int]$chkClusterEvents.Right + 10), 52) 
-    $chkSqlEvents.Location = New-Object System.Drawing.Point(([int]$chkOpsManagerEvents.Right + 10), 52)
-    $filterGroupStartX = ([int]$chkSqlEvents.Right + 25) 
-    $lblFilterEventID.Location = New-Object System.Drawing.Point($filterGroupStartX, 54) 
-    $txtFilterEventID.Location = New-Object System.Drawing.Point(([int]$lblFilterEventID.Right + 5), 52)
-    $lblFilterHelp.Location = New-Object System.Drawing.Point(([int]$txtFilterEventID.Right + 5), 53)
-    $btnClearFilter.Location = New-Object System.Drawing.Point(([int]$lblFilterHelp.Right + 7), 50)
-})
+$legend = New-Object System.Windows.Forms.DataVisualization.Charting.Legend 'Legend'
+$legend.Docking = [System.Windows.Forms.DataVisualization.Charting.Docking]::Top
+$legend.Alignment = [System.Drawing.StringAlignment]::Far
+$legend.BackColor = [System.Drawing.Color]::Transparent; $legend.ForeColor = $theme.ControlForeground
+$legend.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+$legend.IsDockedInsideChartArea = $false
+$chart.Legends.Add($legend)
+$chartTitle = New-Object System.Windows.Forms.DataVisualization.Charting.Title
+$chartTitle.ForeColor = $theme.ControlForeground; $chartTitle.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$chartTitle.Alignment = [System.Drawing.ContentAlignment]::TopLeft; $chartTitle.Docking = [System.Windows.Forms.DataVisualization.Charting.Docking]::Top
+$chartTitle.Text = 'Choose a time range and sources, then click Collect. Drag on the chart to zoom, click a bar or dot to drill in, right-click to zoom out.'
+$chart.Titles.Add($chartTitle)
 
-$topPanel.Controls.AddRange(@($lblTimeFrame, $cmbTimeFrame, $btnGetEvents, $btnExportOpen, $chkClusterEvents, $chkOpsManagerEvents, $chkSqlEvents, $lblFilterEventID, $txtFilterEventID, $lblFilterHelp, $btnClearFilter))
+foreach ($lv in 1, 2, 3, 4) {
+    $s = New-Object System.Windows.Forms.DataVisualization.Charting.Series "L$lv"
+    $s.ChartArea = 'Counts'; $s.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::StackedColumn
+    $s.Color = $levelColors[$lv]; $s.XValueType = [System.Windows.Forms.DataVisualization.Charting.ChartValueType]::DateTime
+    $s.LegendText = $levelNames[$lv]; $s['PointWidth'] = '0.85'; $s.Legend = 'Legend'
+    $chart.Series.Add($s)
+}
+foreach ($lv in 4, 3, 2, 1) {
+    $s = New-Object System.Windows.Forms.DataVisualization.Charting.Series "S$lv"
+    $s.ChartArea = 'Lanes'; $s.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Point
+    $s.Color = [System.Drawing.Color]::FromArgb(220, $levelColors[$lv]); $s.MarkerStyle = [System.Windows.Forms.DataVisualization.Charting.MarkerStyle]::Circle
+    $s.XValueType = [System.Windows.Forms.DataVisualization.Charting.ChartValueType]::DateTime; $s.IsVisibleInLegend = $false
+    $chart.Series.Add($s)
+}
 
-$statusBar = New-Object System.Windows.Forms.StatusStrip; $statusLabel = New-Object System.Windows.Forms.ToolStripStatusLabel "Ready."; $statusLabel.ForeColor = $theme.ControlForeground; $statusBar.Items.Add($statusLabel); $statusBar.BackColor = $theme.FormBackground; $statusBar.Dock = [System.Windows.Forms.DockStyle]::Bottom
-$dgvEvents = New-Object System.Windows.Forms.DataGridView; $dgvEvents.Dock = [System.Windows.Forms.DockStyle]::Fill
-$dgvEvents.ColumnHeadersHeightSizeMode = [System.Windows.Forms.DataGridViewColumnHeadersHeightSizeMode]::AutoSize
-$dgvEvents.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::None 
+# --- Grid + details ---
+$dgvEvents = New-Object System.Windows.Forms.DataGridView
+$dgvEvents.Dock = [System.Windows.Forms.DockStyle]::Fill
 $dgvEvents.ReadOnly = $true; $dgvEvents.MultiSelect = $true; $dgvEvents.AllowUserToAddRows = $false; $dgvEvents.AllowUserToDeleteRows = $false
-$dgvEvents.BackgroundColor = $theme.GridBackground; $dgvEvents.ForeColor = $theme.GridForeground
-$dgvEvents.DefaultCellStyle.BackColor = $theme.GridCellBackground; $dgvEvents.DefaultCellStyle.ForeColor = $theme.GridForeground
-$dgvEvents.DefaultCellStyle.SelectionBackColor = $theme.GridSelectionBackground; $dgvEvents.DefaultCellStyle.SelectionForeColor = $theme.GridSelectionForeground
-$dgvEvents.AlternatingRowsDefaultCellStyle.BackColor = $theme.GridAltCellBackground
-$dgvEvents.ColumnHeadersDefaultCellStyle.BackColor = $theme.GridHeaderBackground; $dgvEvents.ColumnHeadersDefaultCellStyle.ForeColor = $theme.GridHeaderForeground
-$dgvEvents.EnableHeadersVisualStyles = $false; $dgvEvents.RowHeadersVisible = $false
+$dgvEvents.AllowUserToResizeRows = $false; $dgvEvents.RowHeadersVisible = $false; $dgvEvents.AutoGenerateColumns = $false
 $dgvEvents.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
-$dgvEvents.ScrollBars = [System.Windows.Forms.ScrollBars]::Both 
+$dgvEvents.ClipboardCopyMode = [System.Windows.Forms.DataGridViewClipboardCopyMode]::EnableAlwaysIncludeHeaderText
+$dgvEvents.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+$dgvEvents.RowTemplate.Height = 22
+foreach ($g in @($dgvEvents)) {
+    $g.BackgroundColor = $theme.GridBackground; $g.ForeColor = $theme.GridForeground; $g.GridColor = $theme.GridLines
+    $g.DefaultCellStyle.BackColor = $theme.GridCellBackground; $g.DefaultCellStyle.ForeColor = $theme.GridForeground
+    $g.DefaultCellStyle.SelectionBackColor = $theme.GridSelectionBackground; $g.DefaultCellStyle.SelectionForeColor = $theme.GridSelectionForeground
+    $g.AlternatingRowsDefaultCellStyle.BackColor = $theme.GridAltCellBackground
+    $g.ColumnHeadersDefaultCellStyle.BackColor = $theme.GridHeaderBackground; $g.ColumnHeadersDefaultCellStyle.ForeColor = $theme.GridHeaderForeground
+    $g.EnableHeadersVisualStyles = $false
+}
+$dgvSummary = New-Object System.Windows.Forms.DataGridView
+foreach ($p in 'Dock', 'ReadOnly', 'AllowUserToAddRows', 'AllowUserToDeleteRows', 'AllowUserToResizeRows', 'RowHeadersVisible', 'AutoGenerateColumns', 'SelectionMode', 'BorderStyle',
+    'BackgroundColor', 'ForeColor', 'GridColor', 'DefaultCellStyle', 'AlternatingRowsDefaultCellStyle', 'ColumnHeadersDefaultCellStyle', 'EnableHeadersVisualStyles', 'ClipboardCopyMode') {
+    $dgvSummary.$p = $dgvEvents.$p
+}
+$dgvSummary.MultiSelect = $false
+Set-DoubleBuffered $dgvEvents; Set-DoubleBuffered $dgvSummary
 
-$ctxMenu = New-Object System.Windows.Forms.ContextMenuStrip; $selectAllMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem "Select All"; $selectAllMenuItem.ShortcutKeys = ([System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::A); $copyMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem "Copy Selected"; $copyMenuItem.ShortcutKeys = ([System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::C); $exportCsvMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem "Export Displayed to CSV..."; $ctxMenu.Items.AddRange(@($selectAllMenuItem, $copyMenuItem, $exportCsvMenuItem)); $dgvEvents.ContextMenuStrip = $ctxMenu
-$timer = New-Object System.Windows.Forms.Timer; $timer.Interval = 1000
-Function Update-StatusBar ($text, [Switch]$ErrorState) { $statusLabel.Text = $text; if ($ErrorState) { $statusLabel.ForeColor = [System.Drawing.Color]::OrangeRed } else { $statusLabel.ForeColor = $theme.ControlForeground }; $statusBar.Refresh() }
+function Add-GridColumn($Grid, [string]$Prop, [string]$Header, [int]$Width, [string]$Format = $null, [switch]$Fill) {
+    $col = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $col.DataPropertyName = $Prop; $col.Name = $Prop; $col.HeaderText = $Header; $col.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::Automatic
+    if ($Format) { $col.DefaultCellStyle.Format = $Format }
+    if ($Fill) { $col.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::Fill; $col.MinimumWidth = 250 } else { $col.Width = $Width }
+    [void]$Grid.Columns.Add($col)
+}
+Add-GridColumn $dgvEvents 'Time' 'Time' 150 'yyyy-MM-dd HH:mm:ss.fff'
+Add-GridColumn $dgvEvents 'Computer' 'Computer' 100
+Add-GridColumn $dgvEvents 'Level' 'Level' 75
+Add-GridColumn $dgvEvents 'Category' 'Category' 120
+Add-GridColumn $dgvEvents 'Tag' 'Description' 190
+Add-GridColumn $dgvEvents 'Id' 'Event ID' 60
+Add-GridColumn $dgvEvents 'Provider' 'Provider' 170
+Add-GridColumn $dgvEvents 'Summary' 'Message' 400 -Fill
+$dgvEvents.DataSource = $script:View
 
-Function Populate-DataGridView ($data) {
-    $dgvEvents.DataSource = $null; $dgvEvents.AutoGenerateColumns = $false; $dgvEvents.Columns.Clear()
-    if ($data -and $data.Count -gt 0) {
-        $colTimeCreated = New-Object System.Windows.Forms.DataGridViewTextBoxColumn; $colTimeCreated.DataPropertyName = "TimeCreated"; $colTimeCreated.Name = "TimeCreated"; $colTimeCreated.HeaderText = "Time Created"; $colTimeCreated.DefaultCellStyle.Format = "yyyy-MM-dd HH:mm:ss.fff"; $colTimeCreated.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::AllCells
-        $colId = New-Object System.Windows.Forms.DataGridViewTextBoxColumn; $colId.DataPropertyName = "Id"; $colId.Name = "Id"; $colId.HeaderText = "Event ID"; $colId.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::AllCells
-        $colLevel = New-Object System.Windows.Forms.DataGridViewTextBoxColumn; $colLevel.DataPropertyName = "LevelDisplayName"; $colLevel.Name = "LevelDisplayName"; $colLevel.HeaderText = "Level"; $colLevel.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::AllCells
-        $colProvider = New-Object System.Windows.Forms.DataGridViewTextBoxColumn; $colProvider.DataPropertyName = "ProviderName"; $colProvider.Name = "ProviderName"; $colProvider.HeaderText = "Provider"; $colProvider.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::AllCells
-        $colMessage = New-Object System.Windows.Forms.DataGridViewTextBoxColumn; $colMessage.DataPropertyName = "Message"; $colMessage.Name = "Message"; $colMessage.HeaderText = "Message"; $colMessage.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::None; $colMessage.Width = 600; $colMessage.MinimumWidth = 300 
-        $dgvEvents.Columns.AddRange($colTimeCreated, $colId, $colLevel, $colProvider, $colMessage)
-        $dgvEvents.DataSource = [System.Collections.ArrayList]$data
-        foreach ($column in $dgvEvents.Columns) { $column.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::Automatic }
+Add-GridColumn $dgvSummary 'Count' 'Count' 60
+Add-GridColumn $dgvSummary 'Level' 'Worst level' 80
+Add-GridColumn $dgvSummary 'Category' 'Category' 120
+Add-GridColumn $dgvSummary 'Provider' 'Provider' 170
+Add-GridColumn $dgvSummary 'Id' 'Event ID' 60
+Add-GridColumn $dgvSummary 'Tag' 'Description' 200
+Add-GridColumn $dgvSummary 'First' 'First seen' 130 'yyyy-MM-dd HH:mm:ss'
+Add-GridColumn $dgvSummary 'Last' 'Last seen' 130 'yyyy-MM-dd HH:mm:ss'
+Add-GridColumn $dgvSummary 'Computers' 'Hosts' 50
+Add-GridColumn $dgvSummary 'Sample' 'Sample message' 400 -Fill
+$dgvSummary.DataSource = $script:SummaryView
+
+$txtDetail = New-Object System.Windows.Forms.TextBox
+$txtDetail.Multiline = $true; $txtDetail.ReadOnly = $true; $txtDetail.ScrollBars = [System.Windows.Forms.ScrollBars]::Both; $txtDetail.WordWrap = $true
+$txtDetail.Dock = [System.Windows.Forms.DockStyle]::Fill; $txtDetail.Font = New-Object System.Drawing.Font('Consolas', 9)
+$txtDetail.BackColor = $theme.FilterBackground; $txtDetail.ForeColor = $theme.ControlForeground; $txtDetail.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+$txtDetail.Text = 'Select an event to see its full details.'
+
+$txtRunLog = New-Object System.Windows.Forms.TextBox
+$txtRunLog.Multiline = $true; $txtRunLog.ReadOnly = $true; $txtRunLog.ScrollBars = [System.Windows.Forms.ScrollBars]::Both; $txtRunLog.WordWrap = $false
+$txtRunLog.Dock = [System.Windows.Forms.DockStyle]::Fill; $txtRunLog.Font = New-Object System.Drawing.Font('Consolas', 9)
+$txtRunLog.BackColor = $theme.FilterBackground; $txtRunLog.ForeColor = $theme.ControlForeground; $txtRunLog.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+
+$splitEvents = New-Object System.Windows.Forms.SplitContainer
+$splitEvents.Dock = [System.Windows.Forms.DockStyle]::Fill; $splitEvents.Orientation = [System.Windows.Forms.Orientation]::Horizontal
+$splitEvents.BackColor = $theme.FormBackground
+$splitEvents.Panel1.Controls.Add($dgvEvents); $splitEvents.Panel2.Controls.Add($txtDetail)
+
+$tabs = New-Object System.Windows.Forms.TabControl
+$tabs.Dock = [System.Windows.Forms.DockStyle]::Fill
+$tabEvents = New-Object System.Windows.Forms.TabPage 'Events'
+$tabSummary = New-Object System.Windows.Forms.TabPage 'Top issues'
+$tabLog = New-Object System.Windows.Forms.TabPage 'Collection log'
+foreach ($t in $tabEvents, $tabSummary, $tabLog) { $t.BackColor = $theme.FormBackground; [void]$tabs.TabPages.Add($t) }
+$tabEvents.Controls.Add($splitEvents); $tabSummary.Controls.Add($dgvSummary); $tabLog.Controls.Add($txtRunLog)
+
+$splitMain = New-Object System.Windows.Forms.SplitContainer
+$splitMain.Dock = [System.Windows.Forms.DockStyle]::Fill; $splitMain.Orientation = [System.Windows.Forms.Orientation]::Horizontal
+$splitMain.BackColor = $theme.FormBackground
+$splitMain.Panel1.Controls.Add($chart); $splitMain.Panel2.Controls.Add($tabs)
+
+$ctxMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$miCopy = New-Object System.Windows.Forms.ToolStripMenuItem 'Copy selected rows'
+$miCopy.ShortcutKeys = [System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::C
+$miSelectAll = New-Object System.Windows.Forms.ToolStripMenuItem 'Select all'
+$miOnlyId = New-Object System.Windows.Forms.ToolStripMenuItem 'Show only this Event ID'
+$miExcludeId = New-Object System.Windows.Forms.ToolStripMenuItem 'Exclude this Event ID'
+$miAround = New-Object System.Windows.Forms.ToolStripMenuItem 'Zoom timeline to +/- 15 minutes around this event'
+$miExport = New-Object System.Windows.Forms.ToolStripMenuItem 'Export displayed events to CSV...'
+$ctxMenu.Items.AddRange(@($miCopy, $miSelectAll, (New-Object System.Windows.Forms.ToolStripSeparator), $miOnlyId, $miExcludeId, $miAround, (New-Object System.Windows.Forms.ToolStripSeparator), $miExport))
+$dgvEvents.ContextMenuStrip = $ctxMenu
+
+$statusBar = New-Object System.Windows.Forms.StatusStrip
+$statusBar.BackColor = $theme.FormBackground
+$statusLabel = New-Object System.Windows.Forms.ToolStripStatusLabel 'Ready.'
+$statusLabel.ForeColor = $theme.ControlForeground
+[void]$statusBar.Items.Add($statusLabel)
+
+# Fill control first, then top panels (last added docks first = top-most)
+$mainForm.Controls.Add($splitMain)
+$mainForm.Controls.Add($pnlFilter)
+$mainForm.Controls.Add($pnlCollect)
+$mainForm.Controls.Add($statusBar)
+
+$pollTimer = New-Object System.Windows.Forms.Timer; $pollTimer.Interval = 500
+$filterTimer = New-Object System.Windows.Forms.Timer; $filterTimer.Interval = 350
+
+#---- Functions ----
+function Update-StatusBar([string]$Text, [switch]$ErrorState) {
+    $statusLabel.Text = $Text
+    $statusLabel.ForeColor = if ($ErrorState) { [System.Drawing.Color]::OrangeRed } else { $theme.ControlForeground }
+    $statusBar.Refresh()
+}
+
+function Set-RangeFromPreset {
+    $tf = $timeFrames[$cmbRange.SelectedIndex]
+    if ($tf.Hours -le 0) { return }
+    $script:SettingRange = $true
+    $now = Get-Date
+    $dtpTo.Value = $now; $dtpFrom.Value = $now.AddHours(-$tf.Hours)
+    $script:SettingRange = $false
+}
+
+function ConvertTo-FilterLiteral([string]$s) { $s -replace "'", "''" }
+function ConvertTo-LikeLiteral([string]$s) { (ConvertTo-FilterLiteral $s) -replace '([\[\]\*%])', '[$1]' }
+function ConvertTo-DateLiteral([datetime]$d) { '#' + $d.ToString('MM/dd/yyyy HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + '#' }
+
+function Get-RowFilter([switch]$NoTime) {
+    $parts = New-Object System.Collections.Generic.List[string]
+    $levels = @()
+    if ($chkCrit.Checked) { $levels += 1 }; if ($chkErr.Checked) { $levels += 2 }; if ($chkWarn.Checked) { $levels += 3 }; if ($chkInfo.Checked) { $levels += 4 }
+    if ($levels.Count -eq 0) { $parts.Add('LevelNum = -1') } elseif ($levels.Count -lt 4) { $parts.Add("LevelNum IN ($($levels -join ','))") }
+    if ($cmbCategory.SelectedIndex -gt 0) { $parts.Add("Category = '$(ConvertTo-FilterLiteral $cmbCategory.SelectedItem)'") }
+    if ($cmbComputer.SelectedIndex -gt 0) { $parts.Add("Computer = '$(ConvertTo-FilterLiteral $cmbComputer.SelectedItem)'") }
+    $inc = @(); $exc = @()
+    foreach ($tok in ($txtIds.Text -split '[,;\s]+' | Where-Object { $_ })) {
+        if ($tok -match '^-(\d+)$') { $exc += [int]$Matches[1] } elseif ($tok -match '^\d+$') { $inc += [int]$tok }
+    }
+    if ($inc.Count) { $parts.Add("Id IN ($($inc -join ','))") }
+    if ($exc.Count) { $parts.Add("Id NOT IN ($($exc -join ','))") }
+    $q = $txtSearch.Text.Trim()
+    if ($q) { $l = ConvertTo-LikeLiteral $q; $parts.Add("(Message LIKE '%$l%' OR Provider LIKE '%$l%' OR Tag LIKE '%$l%' OR Computer LIKE '%$l%' OR Category LIKE '%$l%')") }
+    if (-not $NoTime -and $script:ViewStart) {
+        $parts.Add("Time >= $(ConvertTo-DateLiteral $script:ViewStart) AND Time < $(ConvertTo-DateLiteral $script:ViewEnd)")
+    }
+    return ($parts -join ' AND ')
+}
+
+function Get-LaneKey($Row) {
+    switch ($cmbLanes.SelectedIndex) {
+        1 { return [string]$Row['Computer'] }
+        2 { return "$($Row['Computer']) | $($Row['Category'])" }
+        3 { return [string]$Row['Provider'] }
+        default { return [string]$Row['Category'] }
     }
 }
 
-Function Apply-EventIdFilter {
-    $filterInputString = $txtFilterEventID.Text.Trim(); $currentDataToFilter = $script:AllEventsData
-    if (-not $currentDataToFilter) { $script:FilteredEventsData = @(); Populate-DataGridView $script:FilteredEventsData; Update-StatusBar "No data to filter."; return }
-    if ([string]::IsNullOrWhiteSpace($filterInputString)) { $script:FilteredEventsData = $currentDataToFilter } else {
-        $includeIDs = [System.Collections.Generic.List[int]]::new(); $excludeIDs = [System.Collections.Generic.List[int]]::new()
-        $tokens = $filterInputString -split '[, ]' | Where-Object {$_ -ne ""}; foreach ($token in $tokens) { if ($token.StartsWith("-")) { $idStr = $token.Substring(1); if ($idStr -match "^\d+$") { [void]$excludeIDs.Add([int]$idStr) } } elseif ($token -match "^\d+$") { [void]$includeIDs.Add([int]$token) } }
-        $tempFilteredData = $currentDataToFilter; if ($includeIDs.Count -gt 0) { $tempFilteredData = $tempFilteredData | Where-Object { $includeIDs -contains $_.Id } }; if ($excludeIDs.Count -gt 0) { $tempFilteredData = $tempFilteredData | Where-Object { -not ($excludeIDs -contains $_.Id) } }; $script:FilteredEventsData = $tempFilteredData
-    }
-    Populate-DataGridView $script:FilteredEventsData; $currentAllCount = if ($script:AllEventsData) { $script:AllEventsData.Count } else { 0 }; $currentFilteredCount = if ($script:FilteredEventsData) { $script:FilteredEventsData.Count } else { 0 }
-    Update-StatusBar "Displaying ${currentFilteredCount} of ${currentAllCount} events."
+function Format-Span([timespan]$ts) {
+    if ($ts.TotalDays -ge 1) { return '{0:N1} days' -f $ts.TotalDays }
+    if ($ts.TotalHours -ge 1) { return '{0:N1} hours' -f $ts.TotalHours }
+    if ($ts.TotalMinutes -ge 1) { return '{0:N0} minutes' -f $ts.TotalMinutes }
+    return '{0:N0} seconds' -f $ts.TotalSeconds
 }
 
-# --- Event Handlers ---
-$btnGetEvents.Add_Click({
-    $btnGetEvents.Enabled = $false; $btnExportOpen.Enabled = $false; $cmbTimeFrame.Enabled = $false; $chkClusterEvents.Enabled = $false; $chkOpsManagerEvents.Enabled = $false; $chkSqlEvents.Enabled = $false; Update-StatusBar "Initializing event retrieval..."; $dgvEvents.DataSource = $null
-    $selectedTimeFrame = $timeFrames[$cmbTimeFrame.SelectedIndex]; $offsetHours = $selectedTimeFrame.Hours
-    $includeCluster = $chkClusterEvents.Checked
-    $includeOpsMgr = $chkOpsManagerEvents.Checked
-    $includeSql = $chkSqlEvents.Checked
+# Single pass over the visible rows: builds the stacked counts, swim-lane dots, markers and the Top issues summary.
+function Update-Visuals {
+    foreach ($s in $chart.Series) { $s.Points.Clear() }
+    $caCounts.AxisX.StripLines.Clear(); $caLanes.AxisX.StripLines.Clear(); $caLanes.AxisY.CustomLabels.Clear(); $legend.CustomItems.Clear()
+    $script:SummaryTable.Rows.Clear()
+    if (-not $script:ViewStart) { return }
 
-    $fetchScriptBlock = { 
-        param($OffsetHoursParam, $IncludeClusterEventsParam, $IncludeOpsManagerEventsParam, $IncludeSqlEventsParam)
+    $bucketSec = $script:BucketSteps | Where-Object { ($script:ViewEnd - $script:ViewStart).TotalSeconds / $_ -le 120 } | Select-Object -First 1
+    if (-not $bucketSec) { $bucketSec = 604800 }
+    $bt = [long]$bucketSec * 10000000L
+    $t0 = $script:ViewStart.Ticks; $t1 = $script:ViewEnd.Ticks
+    $cs = New-Object DateTime ($t0 - ($t0 % $bt))
+    $rem = $t1 % $bt; if ($rem -ne 0) { $t1 += $bt - $rem }
+    $ce = New-Object DateTime $t1
+    $n = [int][math]::Max(1, [math]::Round(($ce.Ticks - $cs.Ticks) / $bt))
+    $script:ChartStart = $cs; $script:BucketTicks = $bt; $script:BucketCount = $n
 
-        Function Get-EventIDListForJobInternal {
-            param (
-                [bool]$PIncludeOpsMgr,
-                [bool]$PIncludeSql,
-                [bool]$PIncludeCluster
-            )
-            $logAndIds = @{}
+    $cnt = @{}; foreach ($lv in 1..4) { $cnt[$lv] = New-Object 'int[]' $n }
+    $cells = @{}; $laneCounts = @{}; $groups = @{}
+    $markers = New-Object System.Collections.Generic.List[object]
+    $total = 0
+    foreach ($drv in $script:View) {
+        $r = $drv.Row
+        $t = [datetime]$r['Time']
+        $b = [int][math]::Floor(($t.Ticks - $cs.Ticks) / $bt)
+        if ($b -lt 0 -or $b -ge $n) { continue }
+        $lv = [int]$r['LevelNum']
+        $cnt[$lv][$b]++
+        $total++
+        $lane = Get-LaneKey $r
+        $laneCounts[$lane] = 1 + [int]$laneCounts[$lane]
+        $ck = "$b|$lane"
+        $cell = $cells[$ck]
+        if (-not $cell) { $cell = @{ B = $b; Lane = $lane; N = 0; Worst = 4; C = (New-Object 'int[]' 5); Top = @{} }; $cells[$ck] = $cell }
+        $cell.N++; $cell.C[$lv]++; if ($lv -lt $cell.Worst) { $cell.Worst = $lv }
+        $tag = [string]$r['Tag']
+        $label = "$($r['Provider']) $($r['Id'])" + $(if ($tag) { " ($tag)" } else { '' })
+        $cell.Top[$label] = 1 + [int]$cell.Top[$label]
 
-            # --- Application Log IDs ---
-            # Default Application IDs (Original script implied these, plus LoadPerf)
-            # Event 1704 removed as per request.
-            $appEventIdsList = [System.Collections.Generic.List[int]]@(
-                1002, # App Crashes, WER, LoadPerf    
-                1705, 1500, 1501 # GPO
-            ) # Other app events like 4097, 9009, 26 are less common for "default RCA"
-            
-            if ($PIncludeSql) {
-                # AddRange needs an IEnumerable of the correct type.
-                $sqlIdsToAdd = [System.Collections.Generic.List[int]]@(17147, 17137, 17803, 18456)
-                $appEventIdsList.AddRange($sqlIdsToAdd)
-            }
-            if ($appEventIdsList.Count -gt 0) { $logAndIds["Application"] = [int[]]$appEventIdsList }
+        $gk = "$($r['Category'])|$($r['Provider'])|$($r['Id'])"
+        $g = $groups[$gk]
+        if (-not $g) { $g = @{ Count = 0; Worst = 4; Cat = $r['Category']; Prov = $r['Provider']; Id = $r['Id']; Tag = $tag; First = $t; Last = $t; Comp = @{}; Sample = $r['Summary'] }; $groups[$gk] = $g }
+        $g.Count++; if ($lv -lt $g.Worst) { $g.Worst = $lv }; if ($t -lt $g.First) { $g.First = $t }; if ($t -gt $g.Last) { $g.Last = $t }; $g.Comp[[string]$r['Computer']] = 1
 
-            # --- System Log IDs (Default from original + expanded) ---
-            # These are the critical ones from your original output and essential RCA.
-            $systemEventIdsList = [System.Collections.Generic.List[int]]@(
-              
-                # === Power / Boot / Shutdown ===
-                # 1,     # Kernel-General: System boot  - Too general, not included
-                12,    # Kernel-General: System shutdown
-                13,    # Kernel-General: System restart
-                41,    # Kernel-Power: The system has rebooted without a clean shutdown (e.g. BSOD/power loss)
-                109,   # Kernel-Power: Kernel power manager shutdown
-                1074,  # User32: Planned restart/shutdown initiated by user or process
-                1076,  # User32: Unplanned restart/shutdown
-
-                # === Service Control Manager (SCM) ===
-                #7000,  # SCM: Service start failure
-                #7001,  # SCM: Dependent service failed to start
-                #7022,  # SCM: Service hung on startup
-                #7023,  # SCM: Service terminated with error status
-                #7024,  # SCM: Service terminated with specific exit code
-                #7031,  # SCM: Service terminated unexpectedly
-                #7034,  # SCM: Service terminated unexpectedly (no auto-restart)
-                #7036,  # SCM: Service state change notification
-
-                # === Windows Update Client ===
-                19,    # WindowsUpdateClient: Update successful
-                20,    # WindowsUpdateClient: Update failed
-                26    # WindowsUpdateClient: Update deferred
-
-                # === Group Policy / Userenv ===
-                #   1500,  # Userenv: GPO applied successfully
-                #   1501,  # Userenv: GPO application failed
-                #   1705,  # PerfNet: Performance counter registry keys updated by GPO
-
-                # === Resource‐Exhaustion / Memory ===
-                #2004,  # Resource-Exhaustion-Detector: Low virtual memory condition
-                #2019,  # SRV: The server was unable to allocate memory from the nonpaged pool
-                #2020,  # SRV: The server was unable to allocate memory from the paged pool
-                #32021,  # SRV: Server ran out of work items
-                #2022,  # SRV: Server ran out of non-blocking work items
-
-                # === Disk / I/O ===
-                #7,     # Disk: The device has a bad block
-                #51,    # Disk: An error was detected on device during a paging operation
-                #57,    # NTFS: Delayed write failed
-                #129,   # StorPort: Reset to device (I/O timeout)
-                #153,   # Disk: I/O operation retried
-                #8193,  # VSS: Volume Shadow Copy Service error  
-
-                # === Driver / Plug-and-Play ===
-                #43,    # Kernel-PnP: Driver failed to start
-                #44     # Kernel-PnP: Driver loaded successfully
-              
-     
-                # === Application and System Crashes ===
-                #1000,  # Application Error: Application crashed
-                #1001,  # Windows Error Reporting: Fault bucket info for crashes (with crash dump reference)
-        
-            )
-            # Add more from the comprehensive list if they are general enough
-            $systemEventIdsList.AddRange(@(1076, 7000, 7001, 7022, 7023, 7024, 7031, 7034, 7036, 43, 44))
-
-            if ($systemEventIdsList.Count -gt 0) { $logAndIds["System"] = [int[]]$systemEventIdsList }
-            
-            if ($PIncludeOpsMgr) { 
-                $opsMgrIds = [int[]]@(1102, 1103, 4502, 4506, 20000, 20020, 20022, 21016, 21034, 26004) 
-                if ($opsMgrIds.Count -gt 0) { $logAndIds["Operations Manager"] = $opsMgrIds }
-            }
-
-            if ($PIncludeCluster) {
-                $clusterOpIds = [int[]]@(1069, 1135, 1146, 1201, 1202, 1205, 1230, 1254, 1557, 1558, 1561, 1573, 1626, 1650, 1726, 1794, 5120, 5121, 5142)
-                if ($clusterOpIds.Count -gt 0) { $logAndIds["Microsoft-Windows-FailoverClustering/Operational"] = $clusterOpIds }
-                
-                $clusterDiagIds = [int[]]@(2050, 2051)
-                if ($clusterDiagIds.Count -gt 0) { $logAndIds["Microsoft-Windows-FailoverClustering/Diagnostic"] = $clusterDiagIds }
-            }
-            return $logAndIds
-        }
-        
-        $startTimeJob = (Get-Date).AddHours($OffsetHoursParam) 
-        $currentEventIDsForLogsJob = Get-EventIDListForJobInternal -PIncludeOpsMgr $IncludeOpsManagerEventsParam -PIncludeSql $IncludeSqlEventsParam -PIncludeCluster $IncludeClusterEventsParam
-
-        $rawRetrievedEventsListJob = [System.Collections.Generic.List[System.Management.Automation.PSObject]]::new()
-        $totalLogsToProcessJob = $currentEventIDsForLogsJob.Keys.Count; $processedLogCountJob = 0
-        
-        foreach ($logNameKeyInLoopJob in $currentEventIDsForLogsJob.Keys) { 
-            $processedLogCountJob++; 
-            if ($Job) { $Job.UserState = "Processing log ${processedLogCountJob} of ${totalLogsToProcessJob}: ${logNameKeyInLoopJob}..." }
-            
-            $idsToFilterJob = $currentEventIDsForLogsJob[$logNameKeyInLoopJob]
-            if (-not $idsToFilterJob -or $idsToFilterJob.Count -eq 0) { Write-Warning "Skipping log (no IDs to filter): ${logNameKeyInLoopJob}"; continue }
-            
-            $filterHashTableJob = @{ LogName = $logNameKeyInLoopJob; StartTime = $startTimeJob; Id = $idsToFilterJob }
-            try { 
-                $foundEventsJob = Get-WinEvent -FilterHashtable $filterHashTableJob -ErrorAction SilentlyContinue
-                if ($foundEventsJob) { 
-                    $eventsCollectionJob = @($foundEventsJob) 
-                    foreach ($eventRecordJob in $eventsCollectionJob) { 
-                        if ($eventRecordJob -ne $null) { $rawRetrievedEventsListJob.Add([System.Management.Automation.PSObject]$eventRecordJob) } 
-                    } 
-                } 
-            } catch { Write-Warning "Error retrieving events from ${logNameKeyInLoopJob} in job: $($_.Exception.Message)" } 
-        }
-        if ($rawRetrievedEventsListJob.Count -eq 0) { return $null }; return $rawRetrievedEventsListJob
+        $mk = [string]$r['Marker']
+        if ($mk) { $markers.Add(@{ Time = $t; Kind = $mk; Computer = [string]$r['Computer']; Tag = $tag }) }
     }
-    $script:EventLogJob = Start-Job -ScriptBlock $fetchScriptBlock -ArgumentList $offsetHours, $includeCluster, $includeOpsMgr, $includeSql -Name "EventLogFetcher"; $timer.Start()
-})
 
-$btnExportOpen.Add_Click({ if ($script:FilteredEventsData -and $script:FilteredEventsData.Count -gt 0) { $tempFilePath = Join-Path $env:TEMP "EventLogReview_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"; try { $script:FilteredEventsData | Export-Csv -Path $tempFilePath -NoTypeInformation -UseCulture -Encoding UTF8; Update-StatusBar "Data exported to ${tempFilePath}"; Start-Process notepad.exe $tempFilePath } catch { Update-StatusBar "Error exporting or opening data: $($_.Exception.Message)" -ErrorState $true; [System.Windows.Forms.MessageBox]::Show("Error exporting or opening data:`n$($_.Exception.Message)","Export Error","OK","Error") } } else { Update-StatusBar "No data to export."; [System.Windows.Forms.MessageBox]::Show("There is no data to export.","No Data","OK","Warning") } })
-
-$timer.Add_Tick({ if ($script:EventLogJob) { 
-    $jobState = $script:EventLogJob.State; $statusText = "Fetching: $($script:EventLogJob.Name) - $($jobState)..."
-    If ($script:EventLogJob.UserState) { $statusText = $script:EventLogJob.UserState } ElseIf ($jobState -ne [System.Management.Automation.JobState]::Running -and $jobState -ne [System.Management.Automation.JobState]::NotStarted) { $statusText = "Job $($script:EventLogJob.Name) - $($jobState)... Finalizing." }
-    Update-StatusBar $statusText
-    if ($jobState -in ([System.Management.Automation.JobState]::Completed, [System.Management.Automation.JobState]::Failed, [System.Management.Automation.JobState]::Stopped)) {
-        $timer.Stop(); if ($jobState -eq [System.Management.Automation.JobState]::Completed) {
-            $rawJobData = Receive-Job $script:EventLogJob; if ($rawJobData) { $script:AllEventsData = $rawJobData | ForEach-Object { [PSCustomObject]@{ TimeCreated = $_.TimeCreated; Id = $_.Id; LevelDisplayName = $_.LevelDisplayName; ProviderName = $_.ProviderName; Message = ($_.Message -replace '[\r\n]+',' ' -replace '\|', ';') } } | Sort-Object TimeCreated } else { $script:AllEventsData = @() }
-            Apply-EventIdFilter; if (-not $rawJobData -and (-not $script:AllEventsData -or $script:AllEventsData.Count -eq 0) ) { Update-StatusBar "No events found matching the criteria." }
-        } else { $reason = "Unknown reason"; if ($script:EventLogJob.JobStateInfo -and $script:EventLogJob.JobStateInfo.Reason) { $reason = $script:EventLogJob.JobStateInfo.Reason }; Update-StatusBar "Job $($script:EventLogJob.Name) ${jobState}: ${reason}" -ErrorState $true; if ($script:EventLogJob.ChildJobs[0].Error.Count -gt 0) { $errorMessages = ($script:EventLogJob.ChildJobs[0].Error | ForEach-Object { $_.ToString() }) -join "`n"; [System.Windows.Forms.MessageBox]::Show("Job failed with errors:`n${errorMessages}", "Job Error","OK","Error") } }
-        Remove-Job $script:EventLogJob -Force ; $script:EventLogJob = $null; $btnGetEvents.Enabled = $true; $btnExportOpen.Enabled = $true; $cmbTimeFrame.Enabled = $true; $chkClusterEvents.Enabled = $true; $chkOpsManagerEvents.Enabled = $true; $chkSqlEvents.Enabled = $true
-    } }})
-
-$txtFilterEventID.Add_TextChanged({ Apply-EventIdFilter })
-$btnClearFilter.Add_Click({ $txtFilterEventID.Text = "" })
-$selectAllMenuItem.Add_Click({ $dgvEvents.SelectAll() })
-$copyMenuItem.Add_Click({ if ($dgvEvents.GetClipboardContent()) { [System.Windows.Forms.Clipboard]::SetDataObject($dgvEvents.GetClipboardContent()); Update-StatusBar "Selected rows copied to clipboard." } })
-
-$exportCsvMenuItem.Add_Click({ 
-    if ($script:FilteredEventsData -and $script:FilteredEventsData.Count -gt 0) {
-        $saveFileDialog = New-Object System.Windows.Forms.SaveFileDialog
-        $saveFileDialog.Filter = "CSV files (*.csv)|*.csv|Text files (*.txt)|*.txt|All files (*.*)|*.*"
-        $saveFileDialog.Title = "Export Displayed Event Data"
-        $saveFileDialog.FileName = "FilteredEventLogReview_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-        if ($saveFileDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-            try {
-                $script:FilteredEventsData | Export-Csv -Path $saveFileDialog.FileName -NoTypeInformation -UseCulture -Encoding UTF8
-                Update-StatusBar "Data exported to $($saveFileDialog.FileName)"
-                [System.Windows.Forms.MessageBox]::Show("Data exported successfully to $($saveFileDialog.FileName)","Export Complete","OK","Information")
-            } catch {
-                Update-StatusBar "Error exporting data: $($_.Exception.Message)" -ErrorState $true
-                [System.Windows.Forms.MessageBox]::Show("Error exporting data:`n$($_.Exception.Message)","Export Error","OK","Error")
-            }
+    # Stacked counts
+    foreach ($lv in 1..4) {
+        $s = $chart.Series["L$lv"]
+        $s.Enabled = ($lv -ne 4 -or $chkInfo.Checked)
+        $arr = $cnt[$lv]
+        for ($b = 0; $b -lt $n; $b++) {
+            $bs = $cs.AddTicks($b * $bt)
+            $idx = $s.Points.AddXY($bs.AddTicks([long]($bt / 2)).ToOADate(), $arr[$b])
+            if ($arr[$b] -gt 0) { $s.Points[$idx].ToolTip = '{0:dd MMM HH:mm:ss} - {1:HH:mm:ss}{2}{3}: {4:N0}' -f $bs, $bs.AddTicks($bt), "`n", $levelNames[$lv], $arr[$b] }
         }
+    }
+
+    # Swim lanes (max 30, the rest grouped as "(other)")
+    $laneList = @($laneCounts.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object { $_.Key })
+    if ($laneList.Count -gt 30) {
+        $keep = @{}; $laneList[0..28] | ForEach-Object { $keep[$_] = $true }
+        foreach ($k in @($cells.Keys)) {
+            $c = $cells[$k]
+            if ($keep.ContainsKey($c.Lane)) { continue }
+            $cells.Remove($k)
+            $ok = "$($c.B)|(other)"; $o = $cells[$ok]
+            if (-not $o) { $o = @{ B = $c.B; Lane = '(other)'; N = 0; Worst = 4; C = (New-Object 'int[]' 5); Top = @{} }; $cells[$ok] = $o }
+            $o.N += $c.N; if ($c.Worst -lt $o.Worst) { $o.Worst = $c.Worst }; for ($i = 1; $i -le 4; $i++) { $o.C[$i] += $c.C[$i] }
+            foreach ($tk in $c.Top.Keys) { $o.Top[$tk] = $c.Top[$tk] + [int]$o.Top[$tk] }
+        }
+        $laneList = @($laneList[0..28]) + '(other)'
+    }
+    $laneList = @($laneList | Where-Object { $_ -ne '(other)' } | Sort-Object) + @($laneList | Where-Object { $_ -eq '(other)' })
+    $script:LaneNames = $laneList
+    $nl = [math]::Max(1, $laneList.Count)
+    $laneIndex = @{}; for ($i = 0; $i -lt $laneList.Count; $i++) { $laneIndex[$laneList[$i]] = $nl - 1 - $i }
+    foreach ($c in $cells.Values) {
+        $y = $laneIndex[$c.Lane]
+        if ($null -eq $y) { continue }
+        $s = $chart.Series["S$($c.Worst)"]
+        $idx = $s.Points.AddXY($cs.AddTicks([long]($c.B * $bt + $bt / 2)).ToOADate(), $y)
+        $p = $s.Points[$idx]
+        $p.MarkerSize = [int][math]::Min(20, 6 + 4 * [math]::Log10($c.N))
+        $top = ($c.Top.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 3 | ForEach-Object { "$($_.Value) x $($_.Key)" }) -join "`n"
+        $p.ToolTip = ("{0}  {1:dd MMM HH:mm}`n{2:N0} events ({3} critical, {4} error, {5} warning, {6} info)`n{7}" -f $c.Lane, $cs.AddTicks($c.B * $bt), $c.N, $c.C[1], $c.C[2], $c.C[3], $c.C[4], $top).Replace('#', '')
+        $p.Tag = "$($c.B)|$($c.Lane)"
+    }
+    for ($i = 0; $i -lt $laneList.Count; $i++) {
+        $y = $nl - 1 - $i; $name = $laneList[$i]
+        if ($name.Length -gt 34) { $name = $name.Substring(0, 33) + '...' }
+        [void]$caLanes.AxisY.CustomLabels.Add($y - 0.5, $y + 0.5, $name)
+    }
+    $caLanes.AxisY.Minimum = -0.5; $caLanes.AxisY.Maximum = $nl - 0.5; $caLanes.AxisY.Interval = 1
+
+    # Lay out the two chart areas: lanes get more room when there are many of them
+    $lanePct = [math]::Min(62, [math]::Max(28, 10 + 4 * $nl))
+    $caCounts.Position.Y = 13; $caCounts.Position.Height = 87 - $lanePct
+    $caLanes.Position.Y = 100 - $lanePct; $caLanes.Position.Height = $lanePct
+
+    foreach ($ca in $caCounts, $caLanes) { $ca.AxisX.Minimum = $cs.ToOADate(); $ca.AxisX.Maximum = $ce.ToOADate() }
+    $span = $ce - $cs
+    $caLanes.AxisX.LabelStyle.Format = if ($bucketSec -ge 86400) { 'dd MMM' } elseif ($span.TotalHours -gt 24) { 'dd MMM HH:mm' } elseif ($bucketSec -lt 60) { 'HH:mm:ss' } else { 'HH:mm' }
+
+    # Markers: reboots, SQL restarts, failovers... (de-duplicated per computer + kind)
+    $gap = [math]::Max(300, $bucketSec)
+    $last = @{}; $shown = New-Object System.Collections.Generic.List[object]
+    foreach ($m in ($markers | Sort-Object { $_.Time })) {
+        $k = "$($m.Computer)|$($m.Kind)"
+        if ($last.ContainsKey($k) -and ($m.Time - $last[$k]).TotalSeconds -lt $gap) { continue }
+        $last[$k] = $m.Time; $shown.Add($m)
+    }
+    $kindsShown = @{}
+    foreach ($m in $shown) {
+        $color = $markerColors[$m.Kind]; if (-not $color) { $color = [System.Drawing.Color]::Gray }
+        $kindsShown[$m.Kind] = $color
+        foreach ($ca in $caCounts, $caLanes) {
+            $sl = New-Object System.Windows.Forms.DataVisualization.Charting.StripLine
+            $sl.IntervalOffset = $m.Time.ToOADate(); $sl.StripWidth = 0
+            $sl.BorderColor = $color; $sl.BorderWidth = 2; $sl.BorderDashStyle = [System.Windows.Forms.DataVisualization.Charting.ChartDashStyle]::Dash
+            $sl.ToolTip = ('{0:yyyy-MM-dd HH:mm:ss}  {1}  {2}' -f $m.Time, $m.Computer, $(if ($m.Tag) { $m.Tag } else { $m.Kind })).Replace('#', '')
+            $ca.AxisX.StripLines.Add($sl)
+        }
+    }
+    foreach ($k in $kindsShown.Keys) {
+        $li = New-Object System.Windows.Forms.DataVisualization.Charting.LegendItem
+        $li.Name = "Marker: $k"; $li.ImageStyle = [System.Windows.Forms.DataVisualization.Charting.LegendImageStyle]::Line
+        $li.Color = $kindsShown[$k]; $li.BorderWidth = 2; $li.BorderDashStyle = [System.Windows.Forms.DataVisualization.Charting.ChartDashStyle]::Dash
+        $legend.CustomItems.Add($li)
+    }
+
+    $chartTitle.Text = ('{0:N0} events  |  {1:yyyy-MM-dd HH:mm} to {2:yyyy-MM-dd HH:mm} ({3})  |  {4} per bar  |  drag to zoom, click to drill in, right-click to zoom out' -f
+        $total, $script:ViewStart, $script:ViewEnd, (Format-Span ($script:ViewEnd - $script:ViewStart)), (Format-Span ([timespan]::FromSeconds($bucketSec))))
+
+    # Top issues
+    $script:SummaryTable.BeginLoadData()
+    foreach ($g in $groups.Values) {
+        [void]$script:SummaryTable.LoadDataRow([object[]]@($g.Count, $levelNames[$g.Worst], $g.Worst, $g.Cat, $g.Prov, $g.Id, $g.Tag, $g.First, $g.Last, $g.Comp.Count, $g.Sample), $true)
+    }
+    $script:SummaryTable.EndLoadData()
+}
+
+function Update-View {
+    if ($script:SuspendFilter) { return }
+    try {
+        $mainForm.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        $script:View.RowFilter = Get-RowFilter
+        Update-Visuals
+        $msg = 'Showing {0:N0} of {1:N0} events' -f $script:View.Count, $script:Table.Rows.Count
+        if ($script:ViewStart) { $msg += ('  |  window {0:yyyy-MM-dd HH:mm:ss} to {1:yyyy-MM-dd HH:mm:ss}' -f $script:ViewStart, $script:ViewEnd) }
+        if ($script:ZoomStack.Count -gt 0) { $msg += '  (zoomed)' }
+        Update-StatusBar $msg
+    } catch {
+        Update-StatusBar "Filter error: $($_.Exception.Message)" -ErrorState
+    } finally { $mainForm.Cursor = [System.Windows.Forms.Cursors]::Default }
+}
+
+function Set-ViewWindow([datetime]$From, [datetime]$To, [switch]$NoPush) {
+    if ($To -le $From) { return }
+    if (-not $NoPush -and $script:ViewStart) { $script:ZoomStack.Push(@($script:ViewStart, $script:ViewEnd)) }
+    $script:ViewStart = $From; $script:ViewEnd = $To
+    Update-View
+}
+function Undo-Zoom {
+    if ($script:ZoomStack.Count -gt 0) { $w = $script:ZoomStack.Pop(); Set-ViewWindow $w[0] $w[1] -NoPush }
+}
+function Reset-Zoom {
+    if (-not $script:CollectStart) { return }
+    $script:ZoomStack.Clear()
+    Set-ViewWindow $script:CollectStart $script:CollectEnd -NoPush
+}
+function Set-ZoomToBucket([int]$Bucket) {
+    $from = $script:ChartStart.AddTicks([long]$Bucket * $script:BucketTicks)
+    $to = $from.AddTicks($script:BucketTicks)
+    if ($to -gt $script:ViewEnd -and $from -lt $script:ViewEnd) { $to = $script:ViewEnd }
+    if ($from -lt $script:ViewStart -and $to -gt $script:ViewStart) { $from = $script:ViewStart }
+    if ($from -eq $script:ViewStart -and $to -eq $script:ViewEnd) { return }
+    Set-ViewWindow $from $to
+}
+
+function Set-ComboItems($Combo, [string[]]$Items) {
+    $current = $Combo.SelectedItem
+    $Combo.Items.Clear(); [void]$Combo.Items.Add('(All)')
+    foreach ($i in $Items) { [void]$Combo.Items.Add($i) }
+    $idx = if ($current) { $Combo.Items.IndexOf($current) } else { 0 }
+    $Combo.SelectedIndex = [math]::Max(0, $idx)
+}
+
+function Set-CollectingState([bool]$Busy) {
+    foreach ($c in $btnCollect, $txtComputers, $btnClusterNodes, $cmbRange, $dtpFrom, $dtpTo, $chkSrcSystem, $chkSrcApp, $chkSrcSql, $chkSrcSqlLogs,
+        $chkSrcCluster, $chkSrcHyperV, $chkSrcSecurity, $chkSrcOpsMgr, $chkIncludeInfo, $nudMax, $btnOpenCsv, $btnExportCsv, $btnHtml) { $c.Enabled = -not $Busy }
+    $btnCancel.Enabled = $Busy
+}
+
+function Import-CollectedEvents($Events) {
+    $script:SuspendFilter = $true
+    $script:Table.BeginLoadData()
+    $script:Table.Rows.Clear()
+    $key = 0
+    foreach ($e in ($Events | Sort-Object { [datetime]$_.Time })) {
+        $msg = [string]$e.Message
+        $summary = $msg -replace '\s+', ' '
+        if ($summary.Length -gt 400) { $summary = $summary.Substring(0, 400) + '...' }
+        [void]$script:Table.LoadDataRow([object[]]@($key, [datetime]$e.Time, [string]$e.Computer, [string]$e.Level, [int]$e.LevelNum, [string]$e.Category,
+                [string]$e.Tag, [string]$e.Marker, [int]$e.Id, [string]$e.Provider, [string]$e.LogName, [string]$e.Source, [long]$e.RecordId, $summary, $msg), $true)
+        $key++
+    }
+    $script:Table.EndLoadData()
+    Set-ComboItems $cmbCategory @($Events | ForEach-Object { [string]$_.Category } | Sort-Object -Unique)
+    Set-ComboItems $cmbComputer @($Events | ForEach-Object { [string]$_.Computer } | Sort-Object -Unique)
+    $script:SuspendFilter = $false
+    $script:ZoomStack.Clear()
+    $script:ViewStart = $script:CollectStart; $script:ViewEnd = $script:CollectEnd
+    Update-View
+}
+
+function Get-DisplayedRows([switch]$IgnoreZoom) {
+    $filter = Get-RowFilter -NoTime:$IgnoreZoom
+    return , $script:Table.Select($filter, 'Time ASC')
+}
+
+function Show-Error([string]$Title, [string]$Text) {
+    Update-StatusBar $Text -ErrorState
+    [void][System.Windows.Forms.MessageBox]::Show($Text, $Title, 'OK', 'Error')
+}
+
+#---- Event handlers ----
+$cmbRange.Add_SelectedIndexChanged({ Set-RangeFromPreset })
+$dtpFrom.Add_ValueChanged({ if (-not $script:SettingRange) { $cmbRange.SelectedIndex = $timeFrames.Count - 1 } })
+$dtpTo.Add_ValueChanged({ if (-not $script:SettingRange) { $cmbRange.SelectedIndex = $timeFrames.Count - 1 } })
+
+$btnClusterNodes.Add_Click({
+    $first = @($txtComputers.Text -split '[,;\s]+' | Where-Object { $_ }) | Select-Object -First 1
+    $isLocal = (-not $first) -or $first -ieq $env:COMPUTERNAME -or $first -in @('.', 'localhost')
+    $nodes = $null
+    Update-StatusBar 'Looking up cluster nodes...'
+    try {
+        $p = @{ Namespace = 'root/MSCluster'; ClassName = 'MSCluster_Node'; ErrorAction = 'Stop' }
+        if (-not $isLocal) { $p.ComputerName = $first }
+        $nodes = @(Get-CimInstance @p | ForEach-Object { $_.Name })
+    } catch {
+        try {
+            Import-Module FailoverClusters -ErrorAction Stop
+            $p = @{ ErrorAction = 'Stop' }; if (-not $isLocal) { $p.Cluster = $first }
+            $nodes = @(Get-ClusterNode @p | ForEach-Object { $_.Name })
+        } catch { }
+    }
+    if ($nodes -and $nodes.Count) {
+        $all = @($txtComputers.Text -split '[,;\s]+' | Where-Object { $_ }) + $nodes | Sort-Object -Unique
+        $txtComputers.Text = $all -join ', '
+        Update-StatusBar "Cluster nodes: $($nodes -join ', ')"
     } else {
-        Update-StatusBar "No data to export."
-        [System.Windows.Forms.MessageBox]::Show("There is no data to export.","No Data","OK","Warning")
+        Show-Error 'Cluster nodes' "Could not find cluster nodes for '$first'. It may not be a cluster node, or WMI / FailoverClusters access was denied."
     }
 })
 
-# Add controls to form
-$mainForm.Controls.Add($dgvEvents) 
-$mainForm.Controls.Add($topPanel)  
-$mainForm.Controls.Add($statusBar) 
+$btnCollect.Add_Click({
+    $computers = @($txtComputers.Text -split '[,;\s]+' | Where-Object { $_ } | Select-Object -Unique)
+    if (-not $computers) { $computers = @($env:COMPUTERNAME); $txtComputers.Text = $env:COMPUTERNAME }
+    if ($timeFrames[$cmbRange.SelectedIndex].Hours -gt 0) { Set-RangeFromPreset }
+    $from = $dtpFrom.Value; $to = $dtpTo.Value
+    if ($from -ge $to) { Show-Error 'Time range' "'From' must be earlier than 'To'."; return }
+    $srcs = @()
+    if ($chkSrcSystem.Checked) { $srcs += 'System' }; if ($chkSrcApp.Checked) { $srcs += 'Application' }
+    if ($chkSrcSql.Checked) { $srcs += 'SQL' }; if ($chkSrcSqlLogs.Checked) { $srcs += 'SQLLogs' }
+    if ($chkSrcCluster.Checked) { $srcs += 'Cluster' }; if ($chkSrcHyperV.Checked) { $srcs += 'HyperV' }
+    if ($chkSrcSecurity.Checked) { $srcs += 'Security' }; if ($chkSrcOpsMgr.Checked) { $srcs += 'OpsMgr' }
+    if (-not $srcs) { Show-Error 'Sources' 'Select at least one source to collect.'; return }
 
-$mainForm.ShowDialog() | Out-Null
-if ($timer.Enabled) { $timer.Stop() }
-if ($script:EventLogJob) { try { Stop-Job $script:EventLogJob -Force } catch {}; try { Remove-Job $script:EventLogJob -Force } catch {} }
+    $script:CollectStart = $from; $script:CollectEnd = $to; $script:Computers = $computers
+    $script:RunLog = @()
+    $txtRunLog.Text = ''
+    Set-CollectingState $true
+    $script:Jobs = @(foreach ($c in $computers) {
+        Start-Job -Name "EventLog_$c" -ScriptBlock $Collector -ArgumentList $c, $from, $to, $srcs, ([int]$nudMax.Value), $chkIncludeInfo.Checked
+    })
+    Update-StatusBar "Collecting from $($computers -join ', ')..."
+    $pollTimer.Start()
+})
+
+$btnCancel.Add_Click({
+    $pollTimer.Stop()
+    foreach ($j in $script:Jobs) { try { Stop-Job $j; Remove-Job $j -Force } catch { } }
+    $script:Jobs = @()
+    Set-CollectingState $false
+    Update-StatusBar 'Collection cancelled.' -ErrorState
+})
+
+$pollTimer.Add_Tick({
+    $running = @($script:Jobs | Where-Object { $_.State -in 'Running', 'NotStarted' })
+    if ($running.Count -gt 0) {
+        $parts = foreach ($j in $running) {
+            $status = 'starting...'
+            $prog = $j.ChildJobs[0].Progress
+            if ($prog -and $prog.Count -gt 0) { $status = $prog[$prog.Count - 1].StatusDescription }
+            "$($j.Name -replace '^EventLog_', ''): $status"
+        }
+        Update-StatusBar ("Collecting ({0} of {1} computers still running)  -  {2}" -f $running.Count, $script:Jobs.Count, ($parts -join '  |  '))
+        return
+    }
+    $pollTimer.Stop()
+    $events = New-Object System.Collections.Generic.List[object]
+    $log = New-Object System.Collections.Generic.List[string]
+    foreach ($j in $script:Jobs) {
+        $name = $j.Name -replace '^EventLog_', ''
+        if ($j.State -eq 'Completed') {
+            $out = @(Receive-Job $j -ErrorAction SilentlyContinue -ErrorVariable jobErrors)
+            $res = $out | Where-Object { $_ -and $_.PSObject.Properties['Events'] } | Select-Object -Last 1
+            if ($res) {
+                if ($res.Events) { foreach ($e in $res.Events) { $events.Add($e) } }
+                if ($res.Log) { foreach ($l in $res.Log) { $log.Add([string]$l) } }
+            } else { $log.Add("[$name] no result returned") }
+            foreach ($err in $jobErrors) { $log.Add("[$name] ERROR: $err") }
+        } else {
+            $reason = if ($j.JobStateInfo.Reason) { $j.JobStateInfo.Reason.Message } else { $j.State }
+            $log.Add("[$name] collection $($j.State): $reason")
+        }
+        Remove-Job $j -Force
+    }
+    $script:Jobs = @()
+    $script:RunLog = $log.ToArray()
+    $txtRunLog.Lines = $script:RunLog
+    Set-CollectingState $false
+    Import-CollectedEvents $events
+    if ($events.Count -eq 0) { Update-StatusBar 'No events found for the selected range and sources - see the Collection log tab.' }
+    $problems = @($script:RunLog | Where-Object { $_ -match 'WARNING|ERROR|failed|not accessible|cannot' })
+    if ($problems.Count) { $tabLog.Text = "Collection log ($($problems.Count) warnings)" } else { $tabLog.Text = 'Collection log' }
+})
+
+# Chart interaction
+$chart.Add_MouseDown({ param($s, $e) $script:ChartDownX = $e.X })
+$chart.Add_SelectionRangeChanged({
+    param($s, $e)
+    $pos = $chart.PointToClient([System.Windows.Forms.Control]::MousePosition)
+    $e.ChartArea.CursorX.SetSelectionPosition([double]::NaN, [double]::NaN)
+    if ([math]::Abs($pos.X - $script:ChartDownX) -le 4) { return }   # a click, handled by MouseClick
+    if ([double]::IsNaN($e.NewSelectionStart) -or [double]::IsNaN($e.NewSelectionEnd) -or -not $script:ViewStart) { return }
+    $a = [DateTime]::FromOADate([math]::Min($e.NewSelectionStart, $e.NewSelectionEnd))
+    $b = [DateTime]::FromOADate([math]::Max($e.NewSelectionStart, $e.NewSelectionEnd))
+    if (($b - $a).TotalSeconds -ge 5) { Set-ViewWindow $a $b }
+})
+$chart.Add_MouseClick({
+    param($s, $e)
+    if (-not $script:ViewStart) { return }
+    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Right) { Undo-Zoom; return }
+    if ([math]::Abs($e.X - $script:ChartDownX) -gt 4) { return }
+    $hit = $chart.HitTest($e.X, $e.Y)
+    if ($hit.ChartElementType -eq [System.Windows.Forms.DataVisualization.Charting.ChartElementType]::DataPoint -and $hit.Series.Name -like 'S*') {
+        $parts = ([string]$hit.Series.Points[$hit.PointIndex].Tag) -split '\|', 2
+        $lane = $parts[1]
+        $script:SuspendFilter = $true
+        switch ($cmbLanes.SelectedIndex) {
+            0 { $i = $cmbCategory.Items.IndexOf($lane); if ($i -ge 0) { $cmbCategory.SelectedIndex = $i } }
+            1 { $i = $cmbComputer.Items.IndexOf($lane); if ($i -ge 0) { $cmbComputer.SelectedIndex = $i } }
+            2 { $cp = $lane -split ' \| ', 2; $i = $cmbComputer.Items.IndexOf($cp[0]); if ($i -ge 0) { $cmbComputer.SelectedIndex = $i }; $i = $cmbCategory.Items.IndexOf($cp[1]); if ($i -ge 0) { $cmbCategory.SelectedIndex = $i } }
+            3 { $txtSearch.Text = $lane; $filterTimer.Stop() }
+        }
+        $script:SuspendFilter = $false
+        Set-ZoomToBucket ([int]$parts[0])
+        return
+    }
+    if ($hit.ChartArea -and $hit.ChartArea.Name -eq 'Counts' -and $hit.ChartElementType -in @('DataPoint', 'PlottingArea', 'Gridlines', 'StripLines')) {
+        $v = $caCounts.AxisX.PixelPositionToValue($e.X)
+        $b = [int][math]::Floor(([DateTime]::FromOADate($v).Ticks - $script:ChartStart.Ticks) / $script:BucketTicks)
+        if ($b -ge 0 -and $b -lt $script:BucketCount) { Set-ZoomToBucket $b }
+    }
+})
+
+# Filters
+foreach ($c in $chkCrit, $chkErr, $chkWarn, $chkInfo) { $c.Add_CheckedChanged({ Update-View }) }
+foreach ($c in $cmbCategory, $cmbComputer, $cmbLanes) { $c.Add_SelectedIndexChanged({ Update-View }) }
+foreach ($t in $txtIds, $txtSearch) { $t.Add_TextChanged({ $filterTimer.Stop(); $filterTimer.Start() }) }
+$filterTimer.Add_Tick({ $filterTimer.Stop(); Update-View })
+$btnClearFilter.Add_Click({
+    $script:SuspendFilter = $true
+    $txtIds.Text = ''; $txtSearch.Text = ''; $cmbCategory.SelectedIndex = 0; $cmbComputer.SelectedIndex = 0
+    foreach ($c in $chkCrit, $chkErr, $chkWarn, $chkInfo) { $c.Checked = $true }
+    $script:SuspendFilter = $false
+    $filterTimer.Stop()
+    Update-View
+})
+$btnZoomOut.Add_Click({ Undo-Zoom })
+$btnResetZoom.Add_Click({ Reset-Zoom })
+
+# Grid
+$dgvEvents.Add_SelectionChanged({
+    $row = $dgvEvents.CurrentRow
+    if (-not $row -or -not $row.DataBoundItem) { return }
+    $r = $row.DataBoundItem.Row
+    $txtDetail.Text = (("Time:      {0:yyyy-MM-dd HH:mm:ss.fff}`r`nComputer:  {1}`r`nLevel:     {2}`r`nCategory:  {3}`r`nDescribed: {4}`r`nLog:       {5}`r`nProvider:  {6}`r`nEvent ID:  {7}`r`nSource:    {8}`r`n" -f
+        $r['Time'], $r['Computer'], $r['Level'], $r['Category'], $r['Tag'], $r['LogName'], $r['Provider'], $r['Id'], $r['Source']) +
+        ('-' * 80) + "`r`n" + ([string]$r['Message'] -replace '(?<!\r)\n', "`r`n"))
+})
+$dgvEvents.Add_CellFormatting({
+    param($s, $e)
+    $name = $dgvEvents.Columns[$e.ColumnIndex].Name
+    if ($name -eq 'Level') {
+        switch ([string]$e.Value) { 'Critical' { $e.CellStyle.ForeColor = $levelColors[1] } 'Error' { $e.CellStyle.ForeColor = $levelColors[2] }
+            'Warning' { $e.CellStyle.ForeColor = $levelColors[3] } 'Audit Failure' { $e.CellStyle.ForeColor = $levelColors[3] } }
+    } elseif ($name -eq 'Tag' -and $e.Value) {
+        $mk = [string]$dgvEvents.Rows[$e.RowIndex].DataBoundItem['Marker']
+        if ($mk -and $markerColors[$mk]) { $e.CellStyle.ForeColor = $markerColors[$mk] }
+    }
+})
+$dgvSummary.Add_CellFormatting({
+    param($s, $e)
+    if ($dgvSummary.Columns[$e.ColumnIndex].Name -eq 'Level') {
+        switch ([string]$e.Value) { 'Critical' { $e.CellStyle.ForeColor = $levelColors[1] } 'Error' { $e.CellStyle.ForeColor = $levelColors[2] } 'Warning' { $e.CellStyle.ForeColor = $levelColors[3] } }
+    }
+})
+$dgvSummary.Add_CellDoubleClick({
+    param($s, $e)
+    if ($e.RowIndex -lt 0) { return }
+    $r = $dgvSummary.Rows[$e.RowIndex].DataBoundItem.Row
+    $script:SuspendFilter = $true
+    $i = $cmbCategory.Items.IndexOf([string]$r['Category']); if ($i -ge 0) { $cmbCategory.SelectedIndex = $i }
+    $txtIds.Text = [string]$r['Id']
+    $script:SuspendFilter = $false
+    $filterTimer.Stop()
+    Update-View
+    $tabs.SelectedTab = $tabEvents
+})
+$toolTip.SetToolTip($dgvSummary, 'Double-click a row to show those events.')
+
+$dgvEvents.Add_CellMouseDown({
+    param($s, $e)
+    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Right -and $e.RowIndex -ge 0 -and -not $dgvEvents.Rows[$e.RowIndex].Selected) {
+        $dgvEvents.ClearSelection(); $dgvEvents.Rows[$e.RowIndex].Selected = $true; $dgvEvents.CurrentCell = $dgvEvents.Rows[$e.RowIndex].Cells[0]
+    }
+})
+$miCopy.Add_Click({ $content = $dgvEvents.GetClipboardContent(); if ($content) { [System.Windows.Forms.Clipboard]::SetDataObject($content); Update-StatusBar 'Selected rows copied to clipboard.' } })
+$miSelectAll.Add_Click({ $dgvEvents.SelectAll() })
+$miOnlyId.Add_Click({ if ($dgvEvents.CurrentRow) { $txtIds.Text = [string]$dgvEvents.CurrentRow.DataBoundItem['Id'] } })
+$miExcludeId.Add_Click({ if ($dgvEvents.CurrentRow) { $txtIds.Text = (($txtIds.Text.Trim() + ' -' + $dgvEvents.CurrentRow.DataBoundItem['Id']).Trim()) } })
+$miAround.Add_Click({
+    if ($dgvEvents.CurrentRow) { $t = [datetime]$dgvEvents.CurrentRow.DataBoundItem['Time']; Set-ViewWindow $t.AddMinutes(-15) $t.AddMinutes(15) }
+})
+
+# Export
+function Save-DisplayedCsv {
+    $rows = Get-DisplayedRows
+    if ($rows.Count -eq 0) { Update-StatusBar 'No data to export.'; return }
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'; $dlg.Title = 'Export displayed events'
+    $dlg.FileName = "EventLogInvestigation_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        try { Export-EventCsv $rows $dlg.FileName; Update-StatusBar "$($rows.Count) events exported to $($dlg.FileName)" }
+        catch { Show-Error 'Export' "Error exporting data: $($_.Exception.Message)" }
+    }
+}
+$btnExportCsv.Add_Click({ Save-DisplayedCsv })
+$miExport.Add_Click({ Save-DisplayedCsv })
+$btnOpenCsv.Add_Click({
+    $rows = Get-DisplayedRows
+    if ($rows.Count -eq 0) { Update-StatusBar 'No data to export.'; return }
+    $path = Join-Path $env:TEMP "EventLogInvestigation_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+    try { Export-EventCsv $rows $path; Invoke-Item $path; Update-StatusBar "Opened $path" }
+    catch { Show-Error 'Export' "Error exporting or opening data: $($_.Exception.Message)" }
+})
+$btnHtml.Add_Click({
+    if ($script:Table.Rows.Count -eq 0) { Update-StatusBar 'Collect some events first.'; return }
+    $rows = Get-DisplayedRows -IgnoreZoom
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Filter = 'HTML report (*.html)|*.html'; $dlg.Title = 'Save interactive HTML report'
+    $dlg.FileName = "EventLogInvestigation_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
+    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        try {
+            $mainForm.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+            New-HtmlReport -Rows $rows -Path $dlg.FileName -Start $script:CollectStart -End $script:CollectEnd -Computers $script:Computers -RunLog $script:RunLog
+            Update-StatusBar "HTML report saved to $($dlg.FileName)"
+            Invoke-Item $dlg.FileName
+        } catch { Show-Error 'HTML report' "Error creating report: $($_.Exception.Message)" }
+        finally { $mainForm.Cursor = [System.Windows.Forms.Cursors]::Default }
+    }
+})
+
+$mainForm.Add_Shown({
+    $splitMain.SplitterDistance = [int]($splitMain.Height * 0.45)
+    $splitEvents.SplitterDistance = [int]($splitEvents.Height * 0.72)
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) { Update-StatusBar 'Not running as Administrator - the Security log and SQL ERRORLOG files may be inaccessible.' -ErrorState }
+    if ($AutoRun) { $btnCollect.PerformClick() }
+})
+$mainForm.Add_FormClosing({
+    $pollTimer.Stop(); $filterTimer.Stop()
+    foreach ($j in $script:Jobs) { try { Stop-Job $j; Remove-Job $j -Force } catch { } }
+})
+
+# Initial time range
+$script:Computers = $ComputerName
+if ($PSBoundParameters.ContainsKey('StartTime') -or $PSBoundParameters.ContainsKey('EndTime')) {
+    $cmbRange.SelectedIndex = $timeFrames.Count - 1
+    $script:SettingRange = $true; $dtpFrom.Value = $StartTime; $dtpTo.Value = $EndTime; $script:SettingRange = $false
+} else {
+    $preset = [array]::IndexOf(@($timeFrames | ForEach-Object { $_.Hours }), $Hours)
+    if ($preset -ge 0) { $cmbRange.SelectedIndex = $preset }
+    else { $cmbRange.SelectedIndex = $timeFrames.Count - 1; $script:SettingRange = $true; $dtpFrom.Value = $StartTime; $dtpTo.Value = $EndTime; $script:SettingRange = $false }
+}
+
+[void]$mainForm.ShowDialog()
 $mainForm.Dispose()
+#endregion
