@@ -915,7 +915,7 @@ svg.addEventListener('contextmenu',ev=>{ev.preventDefault();back();});
 window.addEventListener('resize',()=>{clearTimeout(window.__rt);window.__rt=setTimeout(render,150);});
 
 function drawTop(rows){const g=new Map();
- for(const e of rows){const k=e.cat+'\u0001'+e.p+'\u0001'+e.id;let o=g.get(k);if(!o){o={cat:e.cat,p:e.p,id:e.id,n:0,w:4,f:e.t,la:e.t,tag:e.tag,cs:new Set(),m:e.m};g.set(k,o);}
+ for(const e of rows){const k=e.cat+'\u0001'+e.p+'\u0001'+e.id+(e.id===0?'\u0001'+e.tag:'');let o=g.get(k);if(!o){o={cat:e.cat,p:e.p,id:e.id,n:0,w:4,f:e.t,la:e.t,tag:e.tag,cs:new Set(),m:e.m};g.set(k,o);}
   o.n++;if(e.l<o.w)o.w=e.l;if(e.t<o.f)o.f=e.t;if(e.t>o.la)o.la=e.t;o.cs.add(e.c);}
  const list=[...g.values()].sort((a,b)=>a.w-b.w||b.n-a.n).slice(0,200);
  $('top').innerHTML='<thead><tr><th>Count</th><th>Level</th><th>Category</th><th>Provider</th><th>ID</th><th>Description</th><th>First</th><th>Last</th><th>Hosts</th><th>Sample message</th></tr></thead><tbody>'+
@@ -1146,6 +1146,7 @@ $script:SuspendFilter = $false
 $script:SettingRange = $false
 $script:ChartDownX = 0
 $script:LaneNames = @()
+$script:LaneCount = 1
 
 $script:Table = New-Object System.Data.DataTable 'Events'
 foreach ($c in @(@('Key', [int]), @('Time', [datetime]), @('Computer', [string]), @('Level', [string]), @('LevelNum', [int]), @('Category', [string]),
@@ -1343,7 +1344,7 @@ $i = 1
 foreach ($b in $chkCrit, $chkErr, $chkWarn, $chkInfo) { $b.CheckOnClick = $true; $b.Checked = $true; $b.ForeColor = $levelColors[$i]; $b.ToolTipText = "Show / hide $($levelNames[$i]) events"; $i++ }
 $cmbCategory = New-TsComboBox 165 @('All categories')
 $cmbComputer = New-TsComboBox 140 @('All computers')
-$cmbLanes = New-TsComboBox 165 @('Lanes: Category', 'Lanes: Computer', 'Lanes: Computer + Category', 'Lanes: Provider') 'What the swim lanes under the timeline are grouped by.'
+$cmbLanes = New-TsComboBox 195 @('Lanes: Category', 'Lanes: Computer', 'Lanes: Computer + Category', 'Lanes: Provider') 'What the swim lanes under the timeline are grouped by.'
 $txtIds = New-TsTextBox 110 "Event IDs, comma/space separated. E.g. '1069 1135' or '-7036' to exclude."
 $txtSearch = New-TsTextBox 210 'Search message, provider, description, computer and category (Ctrl+F).'
 $btnClearFilter = New-TsButton 'Clear' 'Clear all filters (Ctrl+Shift+X)'
@@ -1607,6 +1608,16 @@ function Format-Span([timespan]$ts) {
     return '{0:N0} seconds' -f $ts.TotalSeconds
 }
 
+# Lay out the two chart areas: a fixed pixel band for title + legend, lanes get more room when there are many of them
+function Set-ChartLayout {
+    $h = [math]::Max(200, $chart.Height)
+    $topPct = [math]::Min(30, [math]::Ceiling(58 * 100 / $h))
+    $lanePct = [math]::Min(62, [math]::Max(28, 10 + 4 * $script:LaneCount))
+    $lanePct = [math]::Min($lanePct, 100 - $topPct - 20)
+    $caCounts.Position.Y = $topPct; $caCounts.Position.Height = 100 - $topPct - $lanePct
+    $caLanes.Position.Y = 100 - $lanePct; $caLanes.Position.Height = $lanePct
+}
+
 # Single pass over the visible rows: builds the stacked counts, swim-lane dots, markers and the Top issues summary.
 function Update-Visuals {
     foreach ($s in $chart.Series) { $s.Points.Clear() }
@@ -1649,7 +1660,8 @@ function Update-Visuals {
         $label = "$($r['Provider']) $($r['Id'])" + $(if ($tag) { " ($tag)" } else { '' })
         $cell.Top[$label] = 1 + [int]$cell.Top[$label]
 
-        $gk = "$($r['Category'])|$($r['Provider'])|$($r['Id'])"
+        # Log-file entries without an error number (Id 0) are grouped by their description instead
+        $gk = "$($r['Category'])|$($r['Provider'])|$($r['Id'])" + $(if ([int]$r['Id'] -eq 0) { "|$tag" } else { '' })
         $g = $groups[$gk]
         if (-not $g) { $g = @{ Count = 0; Worst = 4; Cat = $r['Category']; Prov = $r['Provider']; Id = $r['Id']; Tag = $tag; First = $t; Last = $t; Comp = @{}; Sample = $r['Summary'] }; $groups[$gk] = $g }
         $g.Count++; if ($lv -lt $g.Worst) { $g.Worst = $lv }; if ($t -lt $g.First) { $g.First = $t }; if ($t -gt $g.Last) { $g.Last = $t }; $g.Comp[[string]$r['Computer']] = 1
@@ -1708,10 +1720,8 @@ function Update-Visuals {
     }
     $caLanes.AxisY.Minimum = -0.5; $caLanes.AxisY.Maximum = $nl - 0.5; $caLanes.AxisY.Interval = 1
 
-    # Lay out the two chart areas: lanes get more room when there are many of them
-    $lanePct = [math]::Min(62, [math]::Max(28, 10 + 4 * $nl))
-    $caCounts.Position.Y = 13; $caCounts.Position.Height = 87 - $lanePct
-    $caLanes.Position.Y = 100 - $lanePct; $caLanes.Position.Height = $lanePct
+    $script:LaneCount = $nl
+    Set-ChartLayout
 
     foreach ($ca in $caCounts, $caLanes) { $ca.AxisX.Minimum = $cs.ToOADate(); $ca.AxisX.Maximum = $ce.ToOADate() }
     $span = $ce - $cs
@@ -2204,6 +2214,7 @@ $pollTimer.Add_Tick({
 })
 
 # Chart interaction
+$chart.Add_Resize({ Set-ChartLayout })
 $chart.Add_MouseDown({ param($s, $e) $script:ChartDownX = $e.X })
 $chart.Add_SelectionRangeChanged({
     param($s, $e)
@@ -2263,7 +2274,7 @@ $btnResetZoom.Add_Click({ Reset-Zoom })
 
 # Grids
 $dgvEvents.Add_SelectionChanged({
-    $row = $dgvEvents.CurrentRow
+    $row = if ($dgvEvents.SelectedRows.Count) { $dgvEvents.SelectedRows[0] } else { $dgvEvents.CurrentRow }
     if (-not $row -or -not $row.DataBoundItem) { return }
     $r = $row.DataBoundItem.Row
     $txtDetail.Text = (("{0:yyyy-MM-dd HH:mm:ss.fff}   {1}   {2}`r`n{3}  |  {4}  |  Event ID {5}`r`n{6}  ({7})`r`n" -f
